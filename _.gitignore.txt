@@ -1,0 +1,30 @@
+# Dữ liệu local & secret — KHÔNG commit
+data/
+*.secret.key
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual env
+venv/
+.venv/
+env/
+ENV/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log

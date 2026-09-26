@@ -1,0 +1,6 @@
+python-telegram-bot==22.8
+google-genai>=1.0.0
+httpx
+cryptography
+psycopg2-binary
+aiohttp
