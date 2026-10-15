@@ -42,8 +42,7 @@ from utils import (
     to_markdown_v2, escape_markdown_v2,
 )
 from ai_module import (
-    AI_HISTORY, AI_PERSONA_PRESETS, GEMINI_MODELS_FREE, ALL_AI_MODELS, model_display_name,
-    _get_all_ai_keys,
+    AI_HISTORY, AI_PERSONA_PRESETS, GEMINI_MODELS_FREE, _get_all_ai_keys,
     _gemini_chat_with_tools, _gemini_chat_with_grounding, _gemini_chat_with_ddg_search,
     get_all_personas, is_builtin_persona,
 )
@@ -83,7 +82,7 @@ from handlers_basic import (
 from handlers_ai import (
     cmd_ai_toggle, cmd_ai_key, cmd_ai_add_key, cmd_ai_list_keys,
     cmd_ai_del_key, cmd_ai_models, cmd_ai_model, cmd_ai_persona,
-    cmd_ai_sys, cmd_ai_clear,
+    cmd_ai_sys, cmd_ai_clear, cmd_ai_provider, cmd_claude_key, cmd_claude_model,
     cmd_ai_persona_new, cmd_ai_persona_del, cmd_ai_persona_edit,
     cmd_ai_memory, cmd_ai_memory_clear,
     cmd_searchdebug, cmd_aithinking, cmd_aigrounding,
@@ -537,24 +536,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── AI: đổi model ──
     if data.startswith("aimdl:"):
         model = data[6:]
-        if model not in ALL_AI_MODELS:
-            await query.answer("❌ Model không hợp lệ", show_alert=True)
-            return
         CONFIG["gemini_model"] = model
         save_config(CONFIG)
-        await query.answer(f"✅ Đã chuyển sang {model_display_name(model)}!", show_alert=False)
+        await query.answer(f"✅ Đã chuyển sang {model}!", show_alert=False)
         kb_rows = []
-        for i in range(0, len(ALL_AI_MODELS), 2):
+        for i in range(0, len(GEMINI_MODELS_FREE), 2):
             row = []
-            for m in ALL_AI_MODELS[i:i+2]:
+            for m in GEMINI_MODELS_FREE[i:i+2]:
                 mark = "✅ " if m == model else ""
-                row.append(InlineKeyboardButton(f"{mark}{model_display_name(m)}", callback_data=f"aimdl:{m}"))
+                row.append(InlineKeyboardButton(f"{mark}{m}", callback_data=f"aimdl:{m}"))
             kb_rows.append(row)
         try:
             await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb_rows))
         except Exception:
             pass
-        await query.message.reply_text(f"✅ *Đã đổi model sang:*\n`{model_display_name(model)}` ạ~", parse_mode="Markdown")
+        await query.message.reply_text(f"✅ *Đã đổi model sang:*\n`{model}` ạ~", parse_mode="Markdown")
         return
 
     # ── AI: đổi persona ──
@@ -1634,6 +1630,9 @@ def main():
         ("aidelkey",  cmd_ai_del_key),
         ("model",  cmd_ai_models),
         ("aimodel",   cmd_ai_model),
+        ("aiprovider", cmd_ai_provider),
+        ("claudekey",  cmd_claude_key),
+        ("claudemodel", cmd_claude_model),
         ("tinhcach", cmd_ai_persona),
         ("aisys",     cmd_ai_sys),
         ("aiclear",   cmd_ai_clear),
@@ -1684,7 +1683,8 @@ def main():
     print(f"  👑 Owner      : {CONFIG['owner_id']}")
     print(f"  🤖 Username   : @{CONFIG.get('bot_username', 'chưa đặt')}")
     print(f"  🕐 Giờ VN     : {now_vn().strftime('%H:%M %d/%m/%Y')} ICT")
-    print(f"  🧠 AI Gemini  : {'🟢 Bật' if CONFIG.get('ai_mode') else '🔴 Tắt'} | {ai_key_info} | {model_display_name(CONFIG.get('gemini_model', '-'))}")
+    print(f"  🧠 AI Gemini  : {'🟢 Bật' if CONFIG.get('ai_mode') else '🔴 Tắt'} | {ai_key_info} | {CONFIG.get('gemini_model', '-')}")
+    print(f"  🤖 Provider   : {CONFIG.get('ai_provider', 'gemini')} | Claude key: {'✅' if CONFIG.get('claude_api_key') else '❌'}")
     print(f"  🎭 AI Nhân vật: {persona_name}")
     print(f"  📡 Proxy      : {'🟢 Bật' if CONFIG.get('proxy_mode') else '🔴 Tắt'}")
     print(f"  👁️  Monitor    : {'🟢 Bật' if CONFIG.get('monitor_mode') else '🔴 Tắt'}")

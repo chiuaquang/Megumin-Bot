@@ -11,10 +11,9 @@ from telegram.ext import ContextTypes
 
 from config import CONFIG, DB, save_config, now_vn, VN_TZ
 from utils import require_owner, safe_reply, MSG_BUFFER, to_markdown_v2
-from index_api import resolve_index_alias
 from ai_module import (
     GEMINI_AVAILABLE, AI_HISTORY, AI_PERSONA_PRESETS, GEMINI_MODELS_FREE,
-    ALL_AI_MODELS, model_display_name, _get_all_ai_keys, _gemini_chat, _gemini_get_sys_prompt, _gemini_chat_vision,
+    _get_all_ai_keys, _gemini_chat, _gemini_get_sys_prompt, _gemini_chat_vision,
     _validate_api_key,
     get_all_personas, is_builtin_persona, create_custom_persona,
     delete_custom_persona, edit_persona_prompt, add_persona_memory, clear_persona_memory,
@@ -44,7 +43,7 @@ async def cmd_ai_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key_status = f"✅ {len(all_keys)} key" if all_keys else "❌ Chưa có — dùng `/aikey KEY`"
         await safe_reply(update,
             f"🤖 *AI GEMINI ĐÃ BẬT* 🤖\n\n"
-            f"📦 *Model:* `{model_display_name(model)}`\n🔑 *Keys:* {key_status}\n"
+            f"📦 *Model:* `{model}`\n🔑 *Keys:* {key_status}\n"
             f"🎭 *Nhân vật:* {persona_name}\n\n"
             f"💬 *Cách dùng:*\n• Tag @bot hoặc reply bot trong nhóm\n• Nhắn bất kỳ trong DM (khi proxy tắt)\n\n"
             f"📋 `/aimodel` · `/tinhcach` · `/aikeys` · `/aiclear`")
@@ -126,19 +125,17 @@ async def cmd_ai_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return
     current = CONFIG.get("gemini_model", "gemini-3.1-flash-lite")
     kb_rows = []
-    for i in range(0, len(ALL_AI_MODELS), 2):
+    for i in range(0, len(GEMINI_MODELS_FREE), 2):
         row = []
-        for m in ALL_AI_MODELS[i:i+2]:
+        for m in GEMINI_MODELS_FREE[i:i+2]:
             mark = "✅ " if m == current else ""
-            row.append(InlineKeyboardButton(f"{mark}{model_display_name(m)}", callback_data=f"aimdl:{m}"))
+            row.append(InlineKeyboardButton(f"{mark}{m}", callback_data=f"aimdl:{m}"))
         kb_rows.append(row)
     kb = InlineKeyboardMarkup(kb_rows)
-    lines = [f"🤖 *CHỌN MODEL AI:*\n", f"📦 *Hiện tại:* `{model_display_name(current)}`\n"]
-    for i, m in enumerate(ALL_AI_MODELS, 1):
+    lines = [f"🤖 *CHỌN MODEL GEMINI:*\n", f"📦 *Hiện tại:* `{current}`\n"]
+    for i, m in enumerate(GEMINI_MODELS_FREE, 1):
         mark = " ✅ *đang dùng*" if m == current else ""
-        lines.append(f"`{i}.` `{model_display_name(m)}`{mark}")
-    lines.append("\n⚠️ _Gemma 35B-A3B / 9B / 2B Fast: chat + ảnh, không có tool quản trị nhóm "
-                 "(ban/mute…), không nghe voice/video. Lỗi → tự dự phòng Gemini._")
+        lines.append(f"`{i}.` `{m}`{mark}")
     lines.append("\n💡 Nhấn nút bên dưới để chuyển model nhanh:")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
 
@@ -146,9 +143,9 @@ async def cmd_ai_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return
     if not context.args:
         await cmd_ai_models(update, context); return
-    model = resolve_index_alias(context.args[0].strip())   # gemma-9b, 2b, 35b...
-    if model not in ALL_AI_MODELS:
-        names = "\n".join(f"• `{m}`" for m in ALL_AI_MODELS)
+    model = context.args[0].strip()
+    if model not in GEMINI_MODELS_FREE:
+        names = "\n".join(f"• `{m}`" for m in GEMINI_MODELS_FREE)
         await safe_reply(update,
             f"⚠️ *`{model}` không có trong danh sách model đã biết!*\n\n"
             f"Các model hợp lệ:\n{names}\n\n"
@@ -158,7 +155,7 @@ async def cmd_ai_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     CONFIG["gemini_model"] = model
     save_config(CONFIG)
-    await safe_reply(update, f"✅ *Đã đổi model sang:* `{model_display_name(model)}` ạ~")
+    await safe_reply(update, f"✅ *Đã đổi model sang:* `{model}` ạ~")
 
 async def cmd_ai_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return
@@ -910,3 +907,68 @@ async def cmd_dbstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await safe_reply(update, f"❌ *Lỗi đọc DB:* `{e}`")
+
+
+# ════════════════════════════════════════════════════════════════
+# CLAUDE (Anthropic) — nhà cung cấp AI thứ hai
+# ════════════════════════════════════════════════════════════════
+
+async def cmd_ai_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/aiprovider [gemini|claude] — chọn AI nào trả lời."""
+    if not await require_owner(update): return
+    from claude_module import get_key, CLAUDE_MODELS
+    cur = CONFIG.get("ai_provider", "gemini")
+    if not context.args:
+        await safe_reply(update,
+            f"🧠 *Nhà cung cấp AI hiện tại:* `{cur}`\n"
+            f"• Gemini key: {'✅' if _get_all_ai_keys() else '❌'}\n"
+            f"• Claude key: {'✅' if get_key() else '❌'} · model `{CONFIG.get('claude_model', CLAUDE_MODELS[0])}`\n\n"
+            f"`/aiprovider claude` · `/aiprovider gemini`\n"
+            f"`/claudekey KEY` → đặt key Claude · `/claudemodel` → đổi model\n"
+            f"_Nếu Claude lỗi, bot tự rơi về Gemini ạ~_"); return
+    choice = context.args[0].strip().lower()
+    if choice not in ("gemini", "claude"):
+        await safe_reply(update, "❓ Chỉ nhận `gemini` hoặc `claude` ạ~"); return
+    if choice == "claude" and not get_key():
+        await safe_reply(update, "⚠️ *Chưa có key Claude!* Dùng `/claudekey KEY` trước ạ~\n🌐 https://console.anthropic.com/"); return
+    CONFIG["ai_provider"] = choice
+    save_config(CONFIG)
+    await safe_reply(update, f"✅ *Đã chuyển AI sang:* `{choice}` ạ~")
+
+
+async def cmd_claude_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/claudekey KEY — lưu & xác thực key Claude (tin nhắn chứa key sẽ bị xoá)."""
+    if not await require_owner(update): return
+    if not context.args:
+        await safe_reply(update,
+            "🔑 `/claudekey KEY` → đặt key Claude\n"
+            "⚠️ API Claude *tính phí* (không có gói API miễn phí). Lấy key: https://console.anthropic.com/"); return
+    key = context.args[0].strip()
+    try:
+        await update.message.delete()   # tránh để lộ key trong chat
+    except Exception:
+        pass
+    from claude_module import validate_key
+    ok, err = await validate_key(key)
+    CONFIG["claude_api_key"] = key
+    save_config(CONFIG)
+    if ok:
+        await context.bot.send_message(update.effective_chat.id,
+            "✅ Key Claude đã lưu & xác thực! Bật bằng `/aiprovider claude` ạ~", parse_mode="Markdown")
+    else:
+        await context.bot.send_message(update.effective_chat.id,
+            f"⚠️ Key đã lưu nhưng xác thực thất bại:\n`{err}`")
+
+
+async def cmd_claude_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/claudemodel [tên] — xem/đổi model Claude."""
+    if not await require_owner(update): return
+    from claude_module import CLAUDE_MODELS
+    cur = CONFIG.get("claude_model", CLAUDE_MODELS[0])
+    if not context.args:
+        names = "\n".join(f"• `{m}`{' ✅' if m == cur else ''}" for m in CLAUDE_MODELS)
+        await safe_reply(update, f"🤖 *Model Claude:*\n{names}\n\nĐổi: `/claudemodel claude-sonnet-5-5`"); return
+    m = context.args[0].strip()
+    CONFIG["claude_model"] = m
+    save_config(CONFIG)
+    await safe_reply(update, f"✅ *Model Claude:* `{m}` ạ~")

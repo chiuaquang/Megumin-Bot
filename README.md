@@ -15,6 +15,7 @@ Owner chính (`OWNER_ID`) có thể **thêm owner phụ** bằng ID Telegram: `/
   hữu ích khi cần chống raid hoặc giữ trật tự tạm thời.
 - **AI Gemini:** chat đa persona (`/tinhcach`), nhận diện & phân tích ảnh (vision),
   tự xoay nhiều API key khi hết quota, tự tìm kiếm web khi cần (Google/Facebook/YouTube).
+- **AI Claude (tuỳ chọn):** `/claudekey KEY` → `/aiprovider claude` để Claude trả lời thay Gemini (chat, ảnh, tool quản trị nhóm). `/claudemodel` đổi model (mặc định `claude-haiku-5-5`). Lỗi thì tự rơi về Gemini. ⚠️ API Claude tính phí. Voice/video vẫn do Gemini xử lý.
 - **AI đọc bối cảnh nhóm:** trả lời dựa trên các tin phía trên (không chỉ câu hỏi), chỉ nói về
   chủ đề đang chat khi được hỏi; tra lịch sử nhóm khi được hỏi ("hôm qua ai nói gì về X").
   Thấy được tin của bot/AI khác như Mira — xem mục *Cho bot thấy bot khác* bên dưới.

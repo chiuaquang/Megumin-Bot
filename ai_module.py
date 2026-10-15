@@ -17,9 +17,6 @@ import time
 
 from config import CONFIG, save_config
 from utils import vlog
-from index_api import (
-    INDEX_MODELS, is_index_model, index_chat, index_display_name,
-)
 
 # DB persistence (imported lazily to avoid circular imports)
 _db = None
@@ -64,48 +61,6 @@ GEMINI_MODELS_FREE = [
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
 ]
-
-# Menu chọn model = Gemini + 3 model Gemma (API call_api.py). Các vòng fallback
-# vẫn chỉ dùng GEMINI_MODELS_FREE (Gemma không chạy qua SDK Gemini).
-ALL_AI_MODELS = GEMINI_MODELS_FREE + list(INDEX_MODELS)
-
-
-def model_display_name(m: str) -> str:
-    return index_display_name(m) if is_index_model(m) else m
-
-
-def _resolve_gemini_model(default: str = "gemini-3.5-flash") -> str:
-    """Model dùng cho code gọi thẳng SDK Gemini: nếu đang chọn Gemma thì dùng
-    model Gemini mặc định (Gemma không có function-calling/audio/video)."""
-    m = CONFIG.get("gemini_model") or default
-    if is_index_model(m):
-        return GEMINI_MODELS_FREE[0] if GEMINI_MODELS_FREE else default
-    return m
-
-
-async def _try_index_chat(chat_id: int, user_text: str, sys_prompt: str, images=None,
-                          history_label: str = ""):
-    """Chat bằng model Gemma đang chọn. Thành công → trả text (đã lưu lịch sử).
-    Lỗi → None nếu còn Gemini để dự phòng, ngược lại trả thông báo lỗi."""
-    model = CONFIG.get("gemini_model")
-    history = AI_HISTORY.get(chat_id, [])
-    try:
-        reply = await index_chat(model, sys_prompt, history, user_text, images=images)
-    except Exception as e:
-        vlog(f"index chat lỗi model={model}: {e!r}")
-        if GEMINI_AVAILABLE and _get_all_ai_keys():
-            return None                      # → rơi xuống luồng Gemini dự phòng
-        return f"❌ *Lỗi {model_display_name(model)}:* `{str(e)[:200]}`"
-    history.append({"role": "user",  "parts": [f"{history_label} {user_text}".strip()]})
-    history.append({"role": "model", "parts": [reply]})
-    if len(history) > AI_MAX_HISTORY * 2:
-        history = history[-(AI_MAX_HISTORY * 2):]
-    AI_HISTORY[chat_id] = history
-    db = _get_db()
-    if db: db.save_history(chat_id, history)
-    _bump_ai_stats()
-    return reply
-
 
 # Model nào thuộc dòng Gemini 3 — CHỈ các model này hỗ trợ thinking_level và
 # kết hợp built-in tool (Google Search/URL Context) cùng lúc với custom
@@ -481,10 +436,12 @@ async def _gemini_chat_with_key(
 async def _gemini_chat(chat_id: int, user_text: str) -> str:
     global _ai_key_index
 
-    if is_index_model(CONFIG.get("gemini_model")):
-        _r = await _try_index_chat(chat_id, user_text, _gemini_get_sys_prompt())
-        if _r is not None:
-            return _r
+    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
+    if _cl_on():
+        try:
+            return await _cl_chat(chat_id, user_text)
+        except ClaudeUnavailable:
+            pass  # rơi về Gemini bên dưới
 
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
@@ -493,7 +450,7 @@ async def _gemini_chat(chat_id: int, user_text: str) -> str:
     if not all_keys:
         return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
-    model_name = _resolve_gemini_model()
+    model_name = CONFIG.get("gemini_model")
     sys_prompt = _gemini_get_sys_prompt()
     history    = AI_HISTORY.get(chat_id, [])
 
@@ -636,8 +593,12 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
 
     global _ai_key_index
 
-    if is_index_model(CONFIG.get("gemini_model")):   # Gemma: không có Search Grounding gốc
-        return await _gemini_chat_with_ddg_search(chat_id, user_text)
+    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
+    if _cl_on():
+        try:
+            return await _cl_chat(chat_id, user_text, with_search=True)
+        except ClaudeUnavailable:
+            pass
 
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
@@ -646,7 +607,7 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
     if not all_keys:
         return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
-    model_name = _resolve_gemini_model()
+    model_name = CONFIG.get("gemini_model")
     sys_prompt = _gemini_get_sys_prompt()
     history    = AI_HISTORY.get(chat_id, [])
 
@@ -951,21 +912,25 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
     """
     global _ai_key_index
 
-    _use_index = is_index_model(CONFIG.get("gemini_model"))
+    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
+    if _cl_on():
+        try:
+            return await _cl_chat(chat_id, user_text, with_search=True)
+        except ClaudeUnavailable:
+            pass
 
-    if not _use_index:
-        if not GEMINI_AVAILABLE:
-            return _MISSING_LIB_MSG
+    if not GEMINI_AVAILABLE:
+        return _MISSING_LIB_MSG
 
-        all_keys = _get_all_ai_keys()
-        if not all_keys:
-            return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
+    all_keys = _get_all_ai_keys()
+    if not all_keys:
+        return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
     # Nếu câu hỏi không cần search → dùng chat thường để nhanh hơn
     if not _should_ddg_search(user_text):
         return await _gemini_chat(chat_id, user_text)
 
-    model_name = _resolve_gemini_model()
+    model_name = CONFIG.get("gemini_model")
     sys_prompt = _gemini_get_sys_prompt()
     history    = AI_HISTORY.get(chat_id, [])
 
@@ -985,18 +950,6 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
         augmented_sys = f"{search_ctx}\n\n{'─'*40}\n\n{sys_prompt}" if sys_prompt else search_ctx
     else:
         augmented_sys = sys_prompt  # search thất bại → chat thường
-
-    if _use_index:
-        _r = await _try_index_chat(chat_id, user_text, augmented_sys)
-        if _r is not None:
-            return _r
-
-    # (Gemma lỗi → dự phòng Gemini; cần key)
-    if not GEMINI_AVAILABLE:
-        return _MISSING_LIB_MSG
-    all_keys = _get_all_ai_keys()
-    if not all_keys:
-        return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
     tried_keys: set = set()
     last_err   = ""
@@ -1296,13 +1249,12 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
     này, KHÔNG lưu vào AI_HISTORY."""
     global _ai_key_index
 
-    # Gemma (API call_api.py) không có function-calling → chat thường có bối cảnh nhóm,
-    # KHÔNG gọi được tool ban/mute/... Muốn dùng tool: /aimodel đổi sang model Gemini.
-    if is_index_model(CONFIG.get("gemini_model")):
-        _r = await _try_index_chat(
-            chat_id, user_text, (_gemini_get_sys_prompt() or "") + (extra_context or ""))
-        if _r is not None:
-            return _r
+    from claude_module import is_active as _cl_on, chat_with_tools as _cl_tools, ClaudeUnavailable
+    if _cl_on():
+        try:
+            return await _cl_tools(chat_id, user_text, bot, action_chat_id, extra_context=extra_context)
+        except ClaudeUnavailable:
+            pass
 
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
@@ -1311,7 +1263,7 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
     if not all_keys:
         return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
-    model_name = _resolve_gemini_model()
+    model_name = CONFIG.get("gemini_model")
     sys_prompt = _gemini_get_sys_prompt()
     history    = AI_HISTORY.get(chat_id, [])
 
@@ -1401,16 +1353,12 @@ async def _gemini_chat_media(
     text lên Gemini, có key-rotation + fallback model giống _gemini_chat()."""
     global _ai_key_index
 
-    # Gemma hiểu được ảnh; audio/video vẫn dùng Gemini.
-    if is_index_model(CONFIG.get("gemini_model")) and all(
-        (m or "").startswith("image/") for _b, m in media_parts
-    ):
-        _r = await _try_index_chat(
-            chat_id, prompt_text, _gemini_get_sys_prompt(),
-            images=list(media_parts), history_label=history_label,
-        )
-        if _r is not None:
-            return _r
+    from claude_module import is_active as _cl_on, chat_media as _cl_media, ClaudeUnavailable
+    if _cl_on():
+        try:
+            return await _cl_media(chat_id, media_parts, prompt_text, history_label)
+        except ClaudeUnavailable:
+            pass
 
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
@@ -1420,7 +1368,7 @@ async def _gemini_chat_media(
         return "⚠️ *Chưa có API key!* Dùng `/aikey KEY` để đặt ạ~"
 
     parts = [genai_types.Part.from_bytes(data=b, mime_type=m) for b, m in media_parts]
-    model_name = _resolve_gemini_model("gemini-2.5-flash")
+    model_name = CONFIG.get("gemini_model", "gemini-2.5-flash")
     sys_prompt = _gemini_get_sys_prompt()
 
     def _save_history(reply_text: str) -> None:

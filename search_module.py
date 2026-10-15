@@ -20,7 +20,7 @@ from urllib.parse import unquote
 import httpx
 
 from config import CONFIG, now_vn
-from ai_module import GEMINI_AVAILABLE, _get_all_ai_keys, _resolve_gemini_model
+from ai_module import GEMINI_AVAILABLE, _get_all_ai_keys
 
 try:
     from google import genai
@@ -576,7 +576,7 @@ async def _ai_expand_youtube_query(user_text: str) -> list[str]:
         "Không thêm bất kỳ giải thích, markdown, hay text nào khác ngoài JSON array."
     )
 
-    model_name = _resolve_gemini_model("gemini-3.1-flash-lite")
+    model_name = CONFIG.get("gemini_model", "gemini-3.1-flash-lite")
     all_keys   = _get_all_ai_keys()
     import json as _json
     for i, key in enumerate(all_keys):
