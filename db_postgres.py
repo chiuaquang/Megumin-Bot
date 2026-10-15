@@ -146,21 +146,15 @@ def save_history(chat_id: int, history: list) -> None:
     if not _conn:
         return
     try:
-        import psycopg2.extras
-        rows = []
-        for i, msg in enumerate(history):
-            parts = msg.get("parts", [])
-            content = parts[0] if parts and isinstance(parts[0], str) else json.dumps(parts, ensure_ascii=False)
-            rows.append((chat_id, i, msg["role"], content))
         with _lock:
             with _conn.cursor() as cur:
-                # 2 round-trip thay vì 1 + N (mỗi INSERT lẻ là 1 lượt mạng tới DB từ xa)
                 cur.execute("DELETE FROM ai_history WHERE chat_id = %s", (chat_id,))
-                if rows:
-                    psycopg2.extras.execute_values(
-                        cur,
-                        "INSERT INTO ai_history (chat_id, idx, role, content) VALUES %s",
-                        rows,
+                for i, msg in enumerate(history):
+                    parts = msg.get("parts", [])
+                    content = parts[0] if parts and isinstance(parts[0], str) else json.dumps(parts, ensure_ascii=False)
+                    cur.execute(
+                        "INSERT INTO ai_history (chat_id, idx, role, content) VALUES (%s, %s, %s, %s)",
+                        (chat_id, i, msg["role"], content)
                     )
     except Exception as e:
         logger.error("[db] save_history(chat_id=%s): %s", chat_id, e)
