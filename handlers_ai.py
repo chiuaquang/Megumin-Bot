@@ -11,9 +11,10 @@ from telegram.ext import ContextTypes
 
 from config import CONFIG, DB, save_config, now_vn, VN_TZ
 from utils import require_owner, safe_reply, MSG_BUFFER, to_markdown_v2
+from index_api import resolve_index_alias
 from ai_module import (
     GEMINI_AVAILABLE, AI_HISTORY, AI_PERSONA_PRESETS, GEMINI_MODELS_FREE,
-    _get_all_ai_keys, _gemini_chat, _gemini_get_sys_prompt, _gemini_chat_vision,
+    ALL_AI_MODELS, model_display_name, _get_all_ai_keys, _gemini_chat, _gemini_get_sys_prompt, _gemini_chat_vision,
     _validate_api_key,
     get_all_personas, is_builtin_persona, create_custom_persona,
     delete_custom_persona, edit_persona_prompt, add_persona_memory, clear_persona_memory,
@@ -43,7 +44,7 @@ async def cmd_ai_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key_status = f"✅ {len(all_keys)} key" if all_keys else "❌ Chưa có — dùng `/aikey KEY`"
         await safe_reply(update,
             f"🤖 *AI GEMINI ĐÃ BẬT* 🤖\n\n"
-            f"📦 *Model:* `{model}`\n🔑 *Keys:* {key_status}\n"
+            f"📦 *Model:* `{model_display_name(model)}`\n🔑 *Keys:* {key_status}\n"
             f"🎭 *Nhân vật:* {persona_name}\n\n"
             f"💬 *Cách dùng:*\n• Tag @bot hoặc reply bot trong nhóm\n• Nhắn bất kỳ trong DM (khi proxy tắt)\n\n"
             f"📋 `/aimodel` · `/tinhcach` · `/aikeys` · `/aiclear`")
@@ -125,17 +126,19 @@ async def cmd_ai_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return
     current = CONFIG.get("gemini_model", "gemini-3.1-flash-lite")
     kb_rows = []
-    for i in range(0, len(GEMINI_MODELS_FREE), 2):
+    for i in range(0, len(ALL_AI_MODELS), 2):
         row = []
-        for m in GEMINI_MODELS_FREE[i:i+2]:
+        for m in ALL_AI_MODELS[i:i+2]:
             mark = "✅ " if m == current else ""
-            row.append(InlineKeyboardButton(f"{mark}{m}", callback_data=f"aimdl:{m}"))
+            row.append(InlineKeyboardButton(f"{mark}{model_display_name(m)}", callback_data=f"aimdl:{m}"))
         kb_rows.append(row)
     kb = InlineKeyboardMarkup(kb_rows)
-    lines = [f"🤖 *CHỌN MODEL GEMINI:*\n", f"📦 *Hiện tại:* `{current}`\n"]
-    for i, m in enumerate(GEMINI_MODELS_FREE, 1):
+    lines = [f"🤖 *CHỌN MODEL AI:*\n", f"📦 *Hiện tại:* `{model_display_name(current)}`\n"]
+    for i, m in enumerate(ALL_AI_MODELS, 1):
         mark = " ✅ *đang dùng*" if m == current else ""
-        lines.append(f"`{i}.` `{m}`{mark}")
+        lines.append(f"`{i}.` `{model_display_name(m)}`{mark}")
+    lines.append("\n⚠️ _Gemma 35B-A3B / 9B / 2B Fast: chat + ảnh, không có tool quản trị nhóm "
+                 "(ban/mute…), không nghe voice/video. Lỗi → tự dự phòng Gemini._")
     lines.append("\n💡 Nhấn nút bên dưới để chuyển model nhanh:")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
 
@@ -143,9 +146,9 @@ async def cmd_ai_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return
     if not context.args:
         await cmd_ai_models(update, context); return
-    model = context.args[0].strip()
-    if model not in GEMINI_MODELS_FREE:
-        names = "\n".join(f"• `{m}`" for m in GEMINI_MODELS_FREE)
+    model = resolve_index_alias(context.args[0].strip())   # gemma-9b, 2b, 35b...
+    if model not in ALL_AI_MODELS:
+        names = "\n".join(f"• `{m}`" for m in ALL_AI_MODELS)
         await safe_reply(update,
             f"⚠️ *`{model}` không có trong danh sách model đã biết!*\n\n"
             f"Các model hợp lệ:\n{names}\n\n"
@@ -155,7 +158,7 @@ async def cmd_ai_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     CONFIG["gemini_model"] = model
     save_config(CONFIG)
-    await safe_reply(update, f"✅ *Đã đổi model sang:* `{model}` ạ~")
+    await safe_reply(update, f"✅ *Đã đổi model sang:* `{model_display_name(model)}` ạ~")
 
 async def cmd_ai_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update): return

@@ -69,7 +69,7 @@ from game_uno import (
 
 from ai_module import (
     GEMINI_AVAILABLE, GEMINI_MODELS_FREE, _get_all_ai_keys, _gemini_get_sys_prompt,
-    get_all_personas,
+    get_all_personas, _resolve_gemini_model,
 )
 try:  # gọi Gemini với cấu hình riêng cho lời thoại (thinking thấp, đọc text an toàn)
     from ai_module import genai, genai_types, _history_to_contents, _is_gemini3, _is_gemini25
@@ -580,7 +580,7 @@ async def ai_banter(situation: str, *, session: "GameSession | None" = None,
     except Exception:
         logger.exception("[game-ai] dựng prompt thoại lỗi")
         return ""
-    primary = CONFIG.get("gemini_model")
+    primary = _resolve_gemini_model()
     # Giống chat AI thường: model chính lỗi/quá tải/hết quota -> tự thử model dự phòng (không hiện nhãn).
     models = [primary] + [m for m in GEMINI_MODELS_FREE if m != primary]
     n = len(keys)

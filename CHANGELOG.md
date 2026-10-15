@@ -6,6 +6,15 @@
 
 # 📋 Changelog
 
+## [2.10.0] — Thêm model Gemma 35B-A3B · 9B · 2B Fast
+
+- Thêm 3 model gọi qua API công khai trong `call_api.py` (endpoint OpenAI-compatible, không cần key):
+  **Gemma 35B-A3B** (`Index-Translate-35B-A3B`) · **Gemma 9B** (`Index-Translate-9B`) · **Gemma 2B Fast** (`Index-Translate-2B`).
+- Chọn bằng `/aimodel` (nút bấm) hoặc gõ tắt: `/aimodel gemma-35b`, `/aimodel gemma-9b`, `/aimodel gemma-2b`.
+- Module mới `index_api.py` (chỉ dùng stdlib, tái sử dụng `call_api.py`); đổi endpoint bằng config `index_api_base`.
+- Hỗ trợ chat + ảnh. **Không** có function-calling (tool ban/mute… tắt khi dùng Gemma), không voice/video (tự dùng Gemini), tìm web dùng DDG thay vì Google Grounding.
+- Gemma lỗi/quá tải → tự dự phòng sang Gemini (nếu có key). Các tính năng gọi thẳng SDK Gemini (monitor tóm tắt, thoại game, tìm YouTube) dùng model Gemini mặc định khi đang chọn Gemma.
+
 ## [2.9.0] — AI đọc bối cảnh nhóm + nhìn thấy bot khác + tra lịch sử · Owner phụ
 
 ### 🧠 AI đọc bối cảnh nhóm (`group_context.py`)

@@ -24,7 +24,7 @@ from config import CONFIG, now_vn, VN_TZ
 from rich_text import get_rich_text
 import bot_identity
 from utils import MSG_BUFFER, MEDIA_GROUP_PENDING, _action_kb, is_owner
-from ai_module import GEMINI_AVAILABLE, GEMINI_MODELS_FREE, _get_all_ai_keys
+from ai_module import GEMINI_AVAILABLE, GEMINI_MODELS_FREE, _get_all_ai_keys, _resolve_gemini_model
 
 try:
     from google import genai
@@ -371,7 +371,7 @@ async def _ai_summarize_chat(entries: list, n: int, mode: str = "n") -> str:
         "sao) vì Telegram không hỗ trợ, sẽ hiện sai hoặc lỗi."
     )
 
-    model_name = CONFIG.get("gemini_model", "gemini-2.0-flash")
+    model_name = _resolve_gemini_model("gemini-2.0-flash")
     all_keys   = _get_all_ai_keys()
     sys_instruction = persona_sys_prompt + summary_instruction
 
