@@ -40,6 +40,70 @@ except ImportError:
     genai = None
     genai_types = None
 
+# ── TỐC ĐỘ: tái dùng Client (giữ kết nối TLS), timeout, lưu DB nền ─────────
+_CLIENT_CACHE: dict = {}
+_AI_TIMEOUT_MS = 40_000   # quá 40s coi như treo → báo lỗi/đổi key thay vì đứng mãi "đang suy nghĩ"
+
+def _get_client(key: str):
+    """Trả về genai.Client dùng lại theo key (không tạo mới mỗi tin → bỏ được bước
+    bắt tay TLS ~0.3-0.8s mỗi lượt) và có timeout cứng."""
+    c = _CLIENT_CACHE.get(key)
+    if c is not None:
+        return c
+    try:
+        c = genai.Client(api_key=key, http_options=genai_types.HttpOptions(timeout=_AI_TIMEOUT_MS))
+    except Exception:
+        c = genai.Client(api_key=key)   # SDK cũ không có HttpOptions → như cũ
+    _CLIENT_CACHE[key] = c
+    return c
+
+_BG_TASKS: set = set()
+
+def _save_history_bg(chat_id: int, history: list) -> None:
+    """Lưu lịch sử AI vào PostgreSQL ở NỀN (thread riêng) — trước đây gọi đồng bộ ngay
+    trên event loop, chặn cả bot + trì hoãn câu trả lời ~1-2s vì 20+ lệnh SQL liên tiếp."""
+    db = _get_db()
+    if not db:
+        return
+    snapshot = [dict(h) for h in history]
+    async def _job():
+        try:
+            await asyncio.to_thread(db.save_history, chat_id, snapshot)
+        except Exception as e:
+            vlog(f"save_history nền lỗi chat_id={chat_id}: {e}")
+    try:
+        t = asyncio.get_running_loop().create_task(_job())
+        _BG_TASKS.add(t)
+        t.add_done_callback(_BG_TASKS.discard)
+    except RuntimeError:
+        db.save_history(chat_id, snapshot)
+
+def _is_transient_error(err_lower: str) -> bool:
+    return any(x in err_lower for x in [
+        "503", "500", "502", "504", "unavailable", "overloaded", "timeout", "timed out",
+        "deadline", "connection", "reset by peer", "internal",
+    ])
+
+# Từ khoá cho thấy tin nhắn CÓ THỂ cần tool (quản trị nhóm / tìm web / tra lịch sử / link).
+# Không khớp → trò chuyện thường, bỏ 65 khai báo tool để Gemini trả lời nhanh hơn rõ rệt.
+# Nghi ngờ thì luôn chọn có tool (an toàn).
+_NEEDS_TOOLS_RE = re.compile(
+    r"(https?://|www\.|@\w|\d{5,}|#\w"
+    r"|\b(ban|unban|kick|mute|unmute|warn|unwarn|pin|unpin|purge|lock|unlock|promote|demote|admin|block|unblock"
+    r"|note|filter|rules?|nội\s*quy|quy\s*định|welcome|antiflood|antilink|slowmode|topic|broadcast|monitor|buffer|setgroup)\b"
+    r"|cấm|đuổi|đá\s|sút|khóa|khoá|mở\s*khóa|mở\s*khoá|xóa|xoá|ghim|bỏ\s*ghim|cảnh\s*cáo|hạ\s*cấp|thăng\s*cấp"
+    r"|chặn|bỏ\s*chặn|đổi\s*tên|đặt\s*tên|mô\s*tả|link\s*mời|thành\s*viên|nhóm|quyền|ghi\s*chú|chức\s*danh|duyệt"
+    r"|tìm|search|youtube|video|nhạc|bài\s*hát|tin\s*tức|thời\s*tiết|giá|hôm\s*qua|lịch\s*sử|ai\s*nói|nói\s*gì"
+    r"|thống\s*kê|danh\s*sách|quên\s*hết|reset|xem\s*giúp|kiểm\s*tra)",
+    re.IGNORECASE,
+)
+
+def _needs_tools(user_text: str) -> bool:
+    t = (user_text or "").strip()
+    if len(t) > 300:          # câu dài/phức tạp → giữ đầy đủ tool cho chắc
+        return True
+    return bool(_NEEDS_TOOLS_RE.search(t))
+
 # ── Agent tools (function calling) — import lazy để tránh vòng import ─
 _agent_tools_mod = None
 def _get_agent_tools():
@@ -418,7 +482,7 @@ def _is_model_error(err_lower: str) -> bool:
 async def _gemini_chat_with_key(
     key: str, model_name: str, sys_prompt: str, history: list, user_text: str
 ) -> str:
-    client = genai.Client(api_key=key)
+    client = _get_client(key)
     config_kwargs = {"system_instruction": sys_prompt if sys_prompt else None}
     thinking_cfg = _build_thinking_config(model_name)
     if thinking_cfg is not None:
@@ -435,13 +499,6 @@ async def _gemini_chat_with_key(
 # ── Main chat function ────────────────────────────────────────────
 async def _gemini_chat(chat_id: int, user_text: str) -> str:
     global _ai_key_index
-
-    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
-    if _cl_on():
-        try:
-            return await _cl_chat(chat_id, user_text)
-        except ClaudeUnavailable:
-            pass  # rơi về Gemini bên dưới
 
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
@@ -475,7 +532,7 @@ async def _gemini_chat(chat_id: int, user_text: str) -> str:
                 history = history[-(AI_MAX_HISTORY * 2):]
             AI_HISTORY[chat_id] = history
             db = _get_db()
-            if db: db.save_history(chat_id, history)
+            _save_history_bg(chat_id, history)
             _bump_ai_stats()
             return reply_text
 
@@ -499,7 +556,7 @@ async def _gemini_chat(chat_id: int, user_text: str) -> str:
                             history = history[-(AI_MAX_HISTORY * 2):]
                         AI_HISTORY[chat_id] = history
                         db = _get_db()
-                        if db: db.save_history(chat_id, history)
+                        _save_history_bg(chat_id, history)
                         _bump_ai_stats()
                         return reply_text
                     except Exception:
@@ -543,7 +600,7 @@ async def _gemini_chat_with_key_grounded(
     if thinking_cfg is not None:
         config_kwargs["thinking_config"] = thinking_cfg
 
-    client = genai.Client(api_key=key)
+    client = _get_client(key)
     config = genai_types.GenerateContentConfig(**config_kwargs)
     chat_session = client.chats.create(
         model=model_name,
@@ -593,13 +650,6 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
 
     global _ai_key_index
 
-    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
-    if _cl_on():
-        try:
-            return await _cl_chat(chat_id, user_text, with_search=True)
-        except ClaudeUnavailable:
-            pass
-
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
 
@@ -632,7 +682,7 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
                 history = history[-(AI_MAX_HISTORY * 2):]
             AI_HISTORY[chat_id] = history
             db = _get_db()
-            if db: db.save_history(chat_id, history)
+            _save_history_bg(chat_id, history)
             _bump_ai_stats()
             return reply_text
 
@@ -656,7 +706,7 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
                             history = history[-(AI_MAX_HISTORY * 2):]
                         AI_HISTORY[chat_id] = history
                         db = _get_db()
-                        if db: db.save_history(chat_id, history)
+                        _save_history_bg(chat_id, history)
                         _bump_ai_stats()
                         return reply_text
                     except Exception:
@@ -912,13 +962,6 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
     """
     global _ai_key_index
 
-    from claude_module import is_active as _cl_on, chat as _cl_chat, ClaudeUnavailable
-    if _cl_on():
-        try:
-            return await _cl_chat(chat_id, user_text, with_search=True)
-        except ClaudeUnavailable:
-            pass
-
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
 
@@ -973,7 +1016,7 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
             AI_HISTORY[chat_id] = history
             db = _get_db()
             if db:
-                db.save_history(chat_id, history)
+                _save_history_bg(chat_id, history)
             _bump_ai_stats()
             # Gắn nhãn nhỏ để người dùng biết đang dùng DDG search
             src_count = len(search_results)
@@ -1002,7 +1045,7 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
                         AI_HISTORY[chat_id] = history
                         db = _get_db()
                         if db:
-                            db.save_history(chat_id, history)
+                            _save_history_bg(chat_id, history)
                         _bump_ai_stats()
                         src_count = len(search_results)
                         label = f"_{src_count} nguồn web_ 🌐\n"
@@ -1111,7 +1154,7 @@ def _fix_agent_reply_links(reply_text: str, tool_call_log: list) -> str:
 
 async def _gemini_chat_with_key_and_tools(
     key: str, model_name: str, sys_prompt: str, history: list, user_text: str,
-    bot, chat_id: int, extra_context: str = "",
+    bot, chat_id: int, extra_context: str = "", use_tools: bool = True,
 ) -> tuple[str, list]:
     """Thực hiện 1 vòng chat có function-calling với 1 API key cụ thể.
     Trả về (reply_text, tool_call_log) — tool_call_log là list các dict mô tả
@@ -1129,26 +1172,29 @@ async def _gemini_chat_with_key_and_tools(
     vậy AI 'đọc' được hội thoại xung quanh như một thành viên bình thường mà
     không làm phình to lịch sử hội thoại đã lưu qua từng lượt."""
     agent_tools = _get_agent_tools()
-    gemini_tools = agent_tools.build_gemini_tools(genai_types)
+    # use_tools=False (tin trò chuyện thường): bỏ toàn bộ khai báo tool + chỉ thị báo cáo
+    # → prompt nhẹ hơn nhiều, Gemini phản hồi nhanh hơn.
+    gemini_tools = agent_tools.build_gemini_tools(genai_types) if use_tools else []
     # Chỉ Gemini 3 mới hỗ trợ trộn built-in tool (google_search, url_context)
     # với custom function declarations cùng lúc — các model cũ hơn sẽ lỗi 400.
-    if _is_gemini3(model_name) and CONFIG.get("ai_grounding", True):
+    if not use_tools:
+        pass
+    elif _is_gemini3(model_name) and CONFIG.get("ai_grounding", True):
         gemini_tools.append(genai_types.Tool(google_search=genai_types.GoogleSearch()))
         if _URL_IN_TEXT_RE.search(user_text):
             gemini_tools.append(genai_types.Tool(url_context=genai_types.UrlContext()))
     elif _is_gemini3(model_name) and _URL_IN_TEXT_RE.search(user_text):
         gemini_tools.append(genai_types.Tool(url_context=genai_types.UrlContext()))
 
-    full_sys_prompt = (sys_prompt or "") + (extra_context or "") + _AGENT_REPORT_INSTRUCTION
-    config_kwargs = {
-        "system_instruction": full_sys_prompt,
-        "tools": gemini_tools,
-    }
+    full_sys_prompt = (sys_prompt or "") + (extra_context or "") + (_AGENT_REPORT_INSTRUCTION if use_tools else "")
+    config_kwargs = {"system_instruction": full_sys_prompt}
+    if gemini_tools:
+        config_kwargs["tools"] = gemini_tools
     thinking_cfg = _build_thinking_config(model_name)
     if thinking_cfg is not None:
         config_kwargs["thinking_config"] = thinking_cfg
 
-    client = genai.Client(api_key=key)
+    client = _get_client(key)
     config = genai_types.GenerateContentConfig(**config_kwargs)
     chat_session = client.chats.create(
         model=model_name,
@@ -1249,13 +1295,6 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
     này, KHÔNG lưu vào AI_HISTORY."""
     global _ai_key_index
 
-    from claude_module import is_active as _cl_on, chat_with_tools as _cl_tools, ClaudeUnavailable
-    if _cl_on():
-        try:
-            return await _cl_tools(chat_id, user_text, bot, action_chat_id, extra_context=extra_context)
-        except ClaudeUnavailable:
-            pass
-
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
 
@@ -1266,6 +1305,17 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
     model_name = CONFIG.get("gemini_model")
     sys_prompt = _gemini_get_sys_prompt()
     history    = AI_HISTORY.get(chat_id, [])
+    use_tools  = _needs_tools(user_text)
+
+    def _commit(reply_text: str) -> None:
+        nonlocal history
+        history.append({"role": "user",  "parts": [user_text]})
+        history.append({"role": "model", "parts": [reply_text]})
+        if len(history) > AI_MAX_HISTORY * 2:
+            history = history[-(AI_MAX_HISTORY * 2):]
+        AI_HISTORY[chat_id] = history
+        _save_history_bg(chat_id, history)   # lưu nền, không chặn việc gửi câu trả lời
+        _bump_ai_stats()
 
     tried_keys: set = set()
     last_err   = ""
@@ -1278,48 +1328,52 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
             continue
         tried_keys.add(key)
         try:
-            reply_text, tool_log = await _gemini_chat_with_key_and_tools(
-                key, model_name, sys_prompt, history, user_text, bot, action_chat_id,
-                extra_context=extra_context,
-            )
+            try:
+                reply_text, tool_log = await _gemini_chat_with_key_and_tools(
+                    key, model_name, sys_prompt, history, user_text, bot, action_chat_id,
+                    extra_context=extra_context, use_tools=use_tools,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e1:
+                # Lỗi tạm thời (503/quá tải/timeout): thử lại 1 lần ngay trên cùng key
+                if _is_transient_error(str(e1).lower()) and not _is_quota_error(e1, str(e1).lower()):
+                    await asyncio.sleep(0.4)
+                    reply_text, tool_log = await _gemini_chat_with_key_and_tools(
+                        key, model_name, sys_prompt, history, user_text, bot, action_chat_id,
+                        extra_context=extra_context, use_tools=use_tools,
+                    )
+                else:
+                    raise
             _ai_key_index = (key_idx + 1) % len(all_keys)
-            history.append({"role": "user",  "parts": [user_text]})
-            history.append({"role": "model", "parts": [reply_text]})
-            if len(history) > AI_MAX_HISTORY * 2:
-                history = history[-(AI_MAX_HISTORY * 2):]
-            AI_HISTORY[chat_id] = history
-            db = _get_db()
-            if db: db.save_history(chat_id, history)
-            _bump_ai_stats()
+            _commit(reply_text)
             if tool_log:
                 vlog(f"agent tool_calls chat_id={action_chat_id}: "
                      f"{[(t['tool'], t['result'].get('ok')) for t in tool_log]}")
             return reply_text
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             err      = str(e).lower()
             last_err = str(e)
-            if _is_quota_error(e, err):
-                continue
+            if _is_quota_error(e, err) or _is_transient_error(err):
+                continue   # sang key kế tiếp
             if _is_model_error(err):
-                for fallback in GEMINI_MODELS_FREE:
-                    if fallback == model_name:
-                        continue
+                # Chỉ thử tối đa 2 model dự phòng nhanh (trước đây duyệt tuần tự cả 6 → chờ rất lâu)
+                fallbacks = [m for m in ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash")
+                             if m != model_name][:2]
+                for fallback in fallbacks:
                     try:
                         reply_text, tool_log = await _gemini_chat_with_key_and_tools(
                             key, fallback, sys_prompt, history, user_text, bot, action_chat_id,
-                            extra_context=extra_context,
+                            extra_context=extra_context, use_tools=use_tools,
                         )
                         _ai_key_index = (key_idx + 1) % len(all_keys)
-                        history.append({"role": "user",  "parts": [user_text]})
-                        history.append({"role": "model", "parts": [reply_text]})
-                        if len(history) > AI_MAX_HISTORY * 2:
-                            history = history[-(AI_MAX_HISTORY * 2):]
-                        AI_HISTORY[chat_id] = history
-                        db = _get_db()
-                        if db: db.save_history(chat_id, history)
-                        _bump_ai_stats()
+                        _commit(reply_text)
                         return reply_text
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
                         continue
             break
@@ -1353,13 +1407,6 @@ async def _gemini_chat_media(
     text lên Gemini, có key-rotation + fallback model giống _gemini_chat()."""
     global _ai_key_index
 
-    from claude_module import is_active as _cl_on, chat_media as _cl_media, ClaudeUnavailable
-    if _cl_on():
-        try:
-            return await _cl_media(chat_id, media_parts, prompt_text, history_label)
-        except ClaudeUnavailable:
-            pass
-
     if not GEMINI_AVAILABLE:
         return _MISSING_LIB_MSG
 
@@ -1379,14 +1426,14 @@ async def _gemini_chat_media(
             history = history[-(AI_MAX_HISTORY * 2):]
         AI_HISTORY[chat_id] = history
         db = _get_db()
-        if db: db.save_history(chat_id, history)
+        _save_history_bg(chat_id, history)
 
     tried_keys: set = set()
     last_err = ""
     start_idx = _ai_key_index % len(all_keys)
 
     async def _attempt(key: str, mdl: str):
-        client = genai.Client(api_key=key)
+        client = _get_client(key)
         config = genai_types.GenerateContentConfig(
             system_instruction=sys_prompt if sys_prompt else None,
         )
@@ -1565,7 +1612,7 @@ async def _validate_api_key(key: str) -> tuple[bool, int, str]:
     if not GEMINI_AVAILABLE:
         return False, 0, "Thiếu thư viện google-genai"
     try:
-        client = genai.Client(api_key=key)
+        client = _get_client(key)
         models = await asyncio.to_thread(lambda: list(client.models.list()))
         return True, len(models), ""
     except Exception as e:

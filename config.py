@@ -58,9 +58,6 @@ DEFAULT_CONFIG: dict = {
     "gemini_api_key":        "",
     "gemini_api_keys_extra": ["", ""],
     "gemini_model":          "gemini-3.5-flash",
-    "ai_provider":           "gemini",   # "gemini" | "claude"
-    "claude_api_key":        "",
-    "claude_model":          "claude-haiku-5-5",
     "ai_mode":               True,
     "ai_persona":            "aemeth",
     "ai_custom_personas":    {},   # nhân vật do owner tự tạo: {key: {name, emoji, trigger, prompt, memory}}
@@ -77,7 +74,7 @@ DEFAULT_CONFIG: dict = {
 
 # ── Fields được mã hóa ──────────────────────────────────────────
 _SENSITIVE_FIELDS = [
-    "token", "gemini_api_key", "gemini_api_keys_extra", "claude_api_key",
+    "token", "gemini_api_key", "gemini_api_keys_extra",
 ]
 
 # ══════════════════════════════════════════════════════════════════
@@ -204,8 +201,6 @@ def load_config() -> dict:
             pass
     if os.environ.get("GEMINI_KEY"):
         cfg["gemini_api_key"] = os.environ["GEMINI_KEY"]
-    if os.environ.get("ANTHROPIC_KEY") or os.environ.get("CLAUDE_KEY"):
-        cfg["claude_api_key"] = (os.environ.get("ANTHROPIC_KEY") or os.environ.get("CLAUDE_KEY")).strip()
     if os.environ.get("GEMINI_KEYS"):
         keys = [k.strip() for k in os.environ["GEMINI_KEYS"].split(",") if k.strip()]
         if keys:

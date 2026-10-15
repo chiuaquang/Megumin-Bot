@@ -1,6 +1,3 @@
-## Claude provider
-- Thêm `claude_module.py`, lệnh `/aiprovider`, `/claudekey`, `/claudemodel`, biến env `ANTHROPIC_KEY`.
-
 ### 🔧 Chỉnh luật Sói Đầu Đàn / Đường Cùng / Hiệp Sĩ
 - **Thanh trừng**: Sói Đầu Đàn thanh trừng được cả **Sát Nhân đã bị nguyền vào bầy** (ngoài các sói trong đàn).
 - **Mất đàn là chết**: hết sói trong đàn (Đầu Đàn không tính; Sát Nhân bị nguyền cũng không tính) thì **sáng hôm sau Đầu Đàn bị treo cổ ngay** (không bỏ phiếu, Quan Toà không huỷ được). Mất đàn giữa ngày → có cảnh báo; đêm đó còn lượt hồi sinh thì hồi sinh 1 sói để tự cứu.

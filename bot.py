@@ -82,7 +82,7 @@ from handlers_basic import (
 from handlers_ai import (
     cmd_ai_toggle, cmd_ai_key, cmd_ai_add_key, cmd_ai_list_keys,
     cmd_ai_del_key, cmd_ai_models, cmd_ai_model, cmd_ai_persona,
-    cmd_ai_sys, cmd_ai_clear, cmd_ai_provider, cmd_claude_key, cmd_claude_model,
+    cmd_ai_sys, cmd_ai_clear,
     cmd_ai_persona_new, cmd_ai_persona_del, cmd_ai_persona_edit,
     cmd_ai_memory, cmd_ai_memory_clear,
     cmd_searchdebug, cmd_aithinking, cmd_aigrounding,
@@ -325,10 +325,7 @@ async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query
     else:
         action_chat_id = CONFIG.get("target_group_id", 0) or None
 
-    status_msg = await send_thinking_status(
-        msg,
-        f"*{get_all_personas().get(CONFIG.get('ai_persona',''), {}).get('name', 'AI').split(' (')[0]} đang suy nghĩ..* 💭",
-    )
+    persona_name = get_all_personas().get(CONFIG.get('ai_persona', ''), {}).get('name', 'AI').split(' (')[0]
 
     async def _do_ai():
         if action_chat_id:
@@ -339,19 +336,49 @@ async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query
             return await _gemini_chat_with_grounding(chat.id, query_text)
         return await _gemini_chat_with_ddg_search(chat.id, query_text)
 
-    task = asyncio.ensure_future(_do_ai())
-    AI_ACTIVE_TASKS[chat.id] = task
-    try:
-        ai_reply = await task
-        try: await status_msg.delete()
-        except Exception: pass
-        await _reply_ai(update, ai_reply)
-    except asyncio.CancelledError:
-        try: await status_msg.delete()
-        except Exception: pass
-        # Không gửi gì thêm — /cancel đã tự thông báo
-    finally:
-        AI_ACTIVE_TASKS.pop(chat.id, None)
+    async def _job():
+        # [TỐC ĐỘ] Gọi Gemini NGAY, đồng thời gửi status "đang suy nghĩ" song song
+        # (trước đây phải chờ gửi status xong mới bắt đầu gọi AI → mất thêm 1 lượt mạng Telegram).
+        task = asyncio.ensure_future(_do_ai())
+        AI_ACTIVE_TASKS[chat.id] = task
+        status_task = asyncio.ensure_future(
+            send_thinking_status(msg, f"*{persona_name} đang suy nghĩ..* 💭")
+        )
+
+        async def _drop_status():
+            try:
+                st = await status_task
+                if st:
+                    await st.delete()
+            except Exception:
+                pass
+
+        try:
+            ai_reply = await task
+            # Gửi câu trả lời TRƯỚC, xóa status song song (không chờ nhau)
+            await asyncio.gather(_reply_ai(update, ai_reply), _drop_status(), return_exceptions=True)
+        except asyncio.CancelledError:
+            await _drop_status()
+            # Không gửi gì thêm — /cancel đã tự thông báo
+        except Exception as e:
+            vlog(f"ai_chat error chat_id={chat.id} err={e}")
+            await _drop_status()
+            try:
+                await safe_reply(update, f"❌ *Lỗi AI:* `{str(e)[:200]}`")
+            except Exception:
+                pass
+        finally:
+            if AI_ACTIVE_TASKS.get(chat.id) is task:
+                AI_ACTIVE_TASKS.pop(chat.id, None)
+
+    # [TỐC ĐỘ] Chạy nền: handler trả về ngay → bot không bị "đóng băng" trong lúc chờ AI
+    # (python-telegram-bot mặc định xử lý tuần tự từng update; nếu không tách ra,
+    # mọi tin/lệnh khác — kể cả /cancel — phải chờ AI trả lời xong).
+    t = asyncio.ensure_future(_job())
+    _AI_JOBS.add(t)
+    t.add_done_callback(_AI_JOBS.discard)
+
+_AI_JOBS: set = set()
 
 # ════════════════════════════════════════════════════════════════
 # TAG COMMAND DISPATCHER (dùng trong nhóm: @bot /lệnh)
@@ -1630,9 +1657,6 @@ def main():
         ("aidelkey",  cmd_ai_del_key),
         ("model",  cmd_ai_models),
         ("aimodel",   cmd_ai_model),
-        ("aiprovider", cmd_ai_provider),
-        ("claudekey",  cmd_claude_key),
-        ("claudemodel", cmd_claude_model),
         ("tinhcach", cmd_ai_persona),
         ("aisys",     cmd_ai_sys),
         ("aiclear",   cmd_ai_clear),
@@ -1684,7 +1708,6 @@ def main():
     print(f"  🤖 Username   : @{CONFIG.get('bot_username', 'chưa đặt')}")
     print(f"  🕐 Giờ VN     : {now_vn().strftime('%H:%M %d/%m/%Y')} ICT")
     print(f"  🧠 AI Gemini  : {'🟢 Bật' if CONFIG.get('ai_mode') else '🔴 Tắt'} | {ai_key_info} | {CONFIG.get('gemini_model', '-')}")
-    print(f"  🤖 Provider   : {CONFIG.get('ai_provider', 'gemini')} | Claude key: {'✅' if CONFIG.get('claude_api_key') else '❌'}")
     print(f"  🎭 AI Nhân vật: {persona_name}")
     print(f"  📡 Proxy      : {'🟢 Bật' if CONFIG.get('proxy_mode') else '🔴 Tắt'}")
     print(f"  👁️  Monitor    : {'🟢 Bật' if CONFIG.get('monitor_mode') else '🔴 Tắt'}")
