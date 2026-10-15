@@ -21,6 +21,8 @@ from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.error import TelegramError
 
 from config import CONFIG, now_vn, VN_TZ
+from rich_text import get_rich_text
+import bot_identity
 from utils import MSG_BUFFER, MEDIA_GROUP_PENDING, _action_kb, is_owner
 from ai_module import GEMINI_AVAILABLE, GEMINI_MODELS_FREE, _get_all_ai_keys
 
@@ -37,7 +39,7 @@ def _buf_entry(msg) -> dict:
     name = user.full_name if user else "Unknown"
     uname = (user.username or "") if user else ""
 
-    text  = msg.text or msg.caption or ""
+    text  = msg.text or msg.caption or get_rich_text(msg) or ""
     mtype = "text"
     if    msg.photo:      mtype = "photo"
     elif  msg.video:      mtype = "video"
@@ -57,6 +59,7 @@ def _buf_entry(msg) -> dict:
         "username": uname,
         "text":     text,
         "type":     mtype,
+        "is_bot":   bool(user and user.is_bot),
         "ts":       now_vn().isoformat(),
         "msg":      msg,          # giữ object gốc để forward media
     }
@@ -98,6 +101,8 @@ async def _push_monitor(bot: Bot, entry: dict, original_msg=None) -> None:
     owner_id = CONFIG.get("owner_id", 0)
     if not owner_id:
         return
+    if bot_identity.is_self_id(entry.get("user_id", 0)):
+        return                                   # tin của CHÍNH bot này: không chuyển sang DM
 
     msg_id  = entry["msg_id"]
     chat_id = entry["chat_id"]
@@ -114,7 +119,7 @@ async def _push_monitor(bot: Bot, entry: dict, original_msg=None) -> None:
 
     header = (
         f"👁️ *[MONITOR]*\n"
-        f"👤 *{entry['name']}*{uname}\n"
+        f"{'🤖' if entry.get('is_bot') else '👤'} *{entry['name']}*{uname}{' `[BOT]`' if entry.get('is_bot') else ''}\n"
         f"🕐 {ts_str} · 📩 `#{msg_id}`"
     )
 
@@ -126,12 +131,13 @@ async def _push_monitor(bot: Bot, entry: dict, original_msg=None) -> None:
 
         if mtype == "text" or not orig:
             text_body = entry.get("text", "")
-            await bot.send_message(
-                owner_id,
-                f"{header}\n\n{text_body[:1000]}" if text_body else header,
-                parse_mode="Markdown",
-                reply_markup=action_kb,
-            )
+            full = f"{header}\n\n{text_body[:3500]}" if text_body else header
+            try:
+                await bot.send_message(owner_id, full, parse_mode="Markdown", reply_markup=action_kb)
+            except TelegramError:
+                # Text của bot khác có thể chứa _ * ` làm Markdown lỗi → gửi lại dạng thường, KHÔNG làm mất tin
+                plain = full.replace("*", "").replace("`", "")
+                await bot.send_message(owner_id, plain, reply_markup=action_kb)
 
         elif mtype == "photo":
             caption_text = entry.get("text", "")
@@ -233,7 +239,7 @@ async def _flush_media_group(bot: Bot, mg_id: str) -> None:
 
     header = (
         f"👁️ *[MONITOR — ALBUM {len(msgs)} ảnh/video]*\n"
-        f"👤 *{entry['name']}*{uname}\n"
+        f"{'🤖' if entry.get('is_bot') else '👤'} *{entry['name']}*{uname}{' `[BOT]`' if entry.get('is_bot') else ''}\n"
         f"🕐 {ts_str} · 📩 `#{entry['msg_id']}`"
     )
 
@@ -390,8 +396,68 @@ async def _ai_summarize_chat(entries: list, n: int, mode: str = "n") -> str:
                     response = await asyncio.to_thread(
                         client2.models.generate_content, model=fallback, contents=prompt, config=config2,
                     )
-                    return f"_(Model dự phòng: {fallback})_\n{response.text.strip()}"
+                    return response.text.strip()
                 except Exception:
                     continue
             break
     return ""
+
+
+# ════════════════════════════════════════════════════════════════
+# DM MONITOR — chuyển TẤT CẢ tin DM của bot này sang DM owner (mỗi bot dùng owner_id riêng)
+#   • 📥 người dùng nhắn DM cho bot (kể cả lệnh /…, tin sửa, media) — bot có xử lý hay bỏ qua cũng chuyển
+#   • 📤 bot trả lời người đó trong DM
+#   Không chuyển DM của chính owner (tránh tự chép vào chính cuộc chat đó).
+#   Tắt riêng DM: đặt CONFIG["monitor_dm"] = False. Vẫn cần /monitor đang bật.
+# ════════════════════════════════════════════════════════════════
+import logging as _logging
+_dm_logger = _logging.getLogger(__name__)
+_DM_BG: set = set()
+_DM_MEDIA_ATTRS = ("photo", "video", "sticker", "voice", "audio", "animation",
+                   "video_note", "document", "poll", "location", "contact", "dice", "venue")
+
+
+async def push_dm_monitor(bot, msg, outgoing: bool = False, edited: bool = False) -> None:
+    try:
+        owner_id = CONFIG.get("owner_id", 0)
+        chat = getattr(msg, "chat", None)
+        if not owner_id or chat is None or chat.type != "private":
+            return
+        if chat.id == owner_id or is_owner(chat.id):
+            return
+        if not CONFIG.get("monitor_mode") or not CONFIG.get("monitor_dm", True):
+            return
+        sender = getattr(msg, "from_user", None)
+        if not outgoing and bot_identity.is_self_user(sender):
+            return                               # tin của CHÍNH bot này
+        if outgoing and not CONFIG.get("monitor_dm_outgoing", False):
+            return                               # mặc định KHÔNG chuyển lời bot tự nói
+        name  = getattr(chat, "full_name", None) or chat.first_name or "?"
+        uname = f" @{chat.username}" if chat.username else ""
+        if bot_identity.is_other_bot(sender):
+            uname += " 🤖 [BOT]"
+        tag   = "📤 [DM · BOT TRẢ LỜI]" if outgoing else ("✏️ [DM · ĐÃ SỬA]" if edited else "📥 [DM]")
+        header = f"{tag}\n👤 {name}{uname} · id {chat.id}\n🕐 {now_vn().strftime('%H:%M %d/%m')} · #{msg.message_id}"
+        text = (msg.text or msg.caption or get_rich_text(msg) or "").strip()
+        if any(getattr(msg, a, None) for a in _DM_MEDIA_ATTRS):
+            await bot.send_message(owner_id, header)
+            await bot.copy_message(owner_id, chat.id, msg.message_id)   # giữ nguyên media + caption
+        else:
+            await bot.send_message(owner_id, f"{header}\n\n{text[:3500]}" if text else header)
+    except Exception as e:
+        _dm_logger.warning("[dm-monitor] lỗi: %s", e)
+
+
+def schedule_dm_monitor(bot, msg, **kw) -> None:
+    """Chạy nền, không làm chậm luồng xử lý chính."""
+    t = asyncio.ensure_future(push_dm_monitor(bot, msg, **kw))
+    _DM_BG.add(t)
+    t.add_done_callback(_DM_BG.discard)
+
+
+async def dm_monitor_tap(update, context) -> None:
+    """Handler group=-1: thấy mọi tin DM tới bot (cả lệnh), không chặn handler khác."""
+    msg = update.message or update.edited_message
+    if msg is None or msg.chat.type != "private":
+        return
+    schedule_dm_monitor(context.bot, msg, edited=update.edited_message is not None)

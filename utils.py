@@ -143,7 +143,7 @@ def to_markdown_v2(text: str) -> str:
     return "".join(out)
 
 # ── Phiên bản & thời điểm khởi động (dùng cho /version, /uptime, /stats) ──
-BOT_VERSION   = "2.2.0"
+BOT_VERSION   = "2.9.0"
 PROCESS_START = now_vn()
 
 # ── Logging (dùng chung toggle search_debug, prefix [VISION-DBG]) ──
@@ -284,8 +284,27 @@ def nf_get_album_msgs(mg_id: str):
     return sorted(entry["msgs"], key=lambda m: getattr(m, "message_id", 0))
 
 # ── Utilities ─────────────────────────────────────────────────────
+def is_primary_owner(uid: int) -> bool:
+    """Owner CHÍNH (OWNER_ID) — duy nhất được thêm/xoá owner phụ."""
+    return bool(uid) and uid == CONFIG.get("owner_id", 0)
+
+def all_owner_ids() -> list:
+    """Owner chính + toàn bộ owner phụ (thêm bằng /addowner)."""
+    ids = []
+    primary = CONFIG.get("owner_id", 0)
+    if primary:
+        ids.append(primary)
+    for x in CONFIG.get("extra_owners") or []:
+        if x not in ids:
+            ids.append(x)
+    return ids
+
 def is_owner(uid: int) -> bool:
-    return uid == CONFIG["owner_id"]
+    """True nếu uid là owner chính HOẶC owner phụ. Mọi gate quyền trong bot
+    đều đi qua hàm này nên owner phụ có đủ quyền như owner chính."""
+    if not uid:
+        return False
+    return uid == CONFIG.get("owner_id", 0) or uid in (CONFIG.get("extra_owners") or [])
 
 def is_bot_admin(uid: int) -> bool:
     return uid in DB.get("admins", [])
@@ -388,19 +407,36 @@ async def require_owner(update: Update) -> bool:
         return False
     return True
 
-async def safe_reply(update: Update, text: str, **kw) -> None:
+def _dm_echo(sent) -> None:
+    """[DM MONITOR] Bot vừa trả lời trong DM → chuyển bản sao sang DM owner (chạy nền)."""
+    try:
+        if sent is not None and sent.chat.type == "private":
+            from handlers_monitor import schedule_dm_monitor   # import muộn: tránh vòng import
+            schedule_dm_monitor(sent.get_bot(), sent, outgoing=True)
+    except Exception:
+        pass
+
+
+async def safe_reply(update: Update, text: str, **kw):
+    """Trả lời tin nhắn. Trả về Message đã gửi (hoặc None nếu thất bại) để nơi
+    gọi có thể ghi lại message_id — các caller cũ bỏ qua giá trị trả về nên
+    không bị ảnh hưởng."""
     message = getattr(update, "message", None) or getattr(update, "effective_message", None)
     if not message:
-        return
+        return None
     try:
-        await message.reply_text(
+        sent = await message.reply_text(
             to_markdown_v2(text), parse_mode=ParseMode.MARKDOWN_V2, **kw
         )
+        _dm_echo(sent)
+        return sent
     except Exception:
         try:
-            await message.reply_text(text, **kw)
+            sent = await message.reply_text(text, **kw)
+            _dm_echo(sent)
+            return sent
         except Exception:
-            pass
+            return None
 
 # ── Media đính kèm (ảnh/video/gif) cho câu thoại / filter / status AI ─────
 def _detect_message_media(message):
@@ -631,11 +667,11 @@ async def send_styled(target, text: str, media=None) -> None:
             return
     if hasattr(message, "reply_text"):
         try:
-            await message.reply_text(to_markdown_v2(text), parse_mode=ParseMode.MARKDOWN_V2)
+            _dm_echo(await message.reply_text(to_markdown_v2(text), parse_mode=ParseMode.MARKDOWN_V2))
             return
         except Exception:
             try:
-                await message.reply_text(text)
+                _dm_echo(await message.reply_text(text))
                 return
             except Exception:
                 return
@@ -1069,6 +1105,40 @@ async def send_thinking_status(message_or_update, status_text: str):
     except Exception:
         return await message.reply_text(status_text)
 
+async def send_thinking_status_to_chat(bot, chat_id: int, status_text: str):
+    """Giống `send_thinking_status` nhưng gửi thẳng vào `chat_id` (không cần có 1
+    message để reply) — dùng cho minigame, nơi Bot tự lên tiếng trong nhóm mà không
+    trả lời tin nhắn nào. ĐỒNG BỘ với /setthinkingmedia: owner đã set media riêng thì
+    gửi kèm đúng media đó, chưa set thì chỉ gửi text. Trả về message đã gửi (hoặc
+    None nếu gửi thất bại) để caller xoá đi sau khi AI trả lời xong."""
+    media       = get_thinking_media()
+    safe_status = to_markdown_v2(status_text)
+    if media and media.get("file_id"):
+        mtype = media.get("type")
+        sender = {
+            "photo":     getattr(bot, "send_photo", None),
+            "video":     getattr(bot, "send_video", None),
+            "animation": getattr(bot, "send_animation", None),
+        }.get(mtype)
+        if sender:
+            try:
+                sent = await sender(chat_id, media["file_id"], caption=safe_status,
+                                    parse_mode=ParseMode.MARKDOWN_V2)
+                new_fid = _extract_sent_file_id(sent, mtype)
+                if new_fid and new_fid != media["file_id"]:
+                    media["file_id"] = new_fid
+                    save_db(DB)
+                return sent
+            except Exception:
+                pass  # rớt xuống gửi text thường bên dưới
+    try:
+        return await bot.send_message(chat_id, safe_status, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        try:
+            return await bot.send_message(chat_id, status_text)
+        except Exception:
+            return None
+
 def extract_msg_id_from_link(raw: str) -> int | None:
     """Trích message_id từ link Telegram hoặc số nguyên."""
     raw = raw.strip()
@@ -1480,6 +1550,13 @@ HELP_SECTIONS = {
             "• `/aiaddkey key` — Thêm API key phụ (dự phòng khi hết quota)\n"
             "• `/aikeys` — Xem toàn bộ key đang có\n"
             "• `/aidelkey n` — Xóa key phụ thứ n\n\n"
+            "*🧠 Bối cảnh & lịch sử nhóm:*\n"
+            "• Trong nhóm, AI tự đọc các tin gần nhất (kể cả tin của bot/AI khác như Mira) "
+            "nhưng chỉ nói về chủ đề đang chat khi ngài hỏi tới\n"
+            "• Hỏi tự nhiên để tra tin cũ: \"hôm qua ai nói gì về X\", \"A nhắn gì lúc sáng\"\n"
+            "• `/aictx` — Xem cấu hình · `/aictx 40` — số tin bối cảnh (0 = tắt)\n"
+            "• `/aictx chars 8000` — trần ký tự · `/aictx log on|off` — ghi lịch sử nhóm\n"
+            "• `/aictx clear` — Xoá lịch sử đã lưu của nhóm\n\n"
             "*🔍 Tìm kiếm:*\n"
             "• `/searchdebug` — Bật/tắt log debug quá trình tìm kiếm\n"
             "• `/aigrounding` — Bật/tắt Google Search Grounding gốc của Gemini. "
@@ -1489,12 +1566,54 @@ HELP_SECTIONS = {
             "⚠️ Tính phí riêng theo lượt ngoài hạn mức free — khác hoàn toàn scrape cũ"
         ),
     },
+    "owners": {
+        "emoji": "👑", "title": "OWNER",
+        "overview": "/addowner, /delowner, /owners",
+        "body": (
+            "*👑 QUẢN LÝ OWNER*\n\n"
+            "• `/addowner id` _(hoặc `@username`, hoặc reply)_ — Thêm owner phụ bằng ID Telegram\n"
+            "• `/delowner id` — Xoá owner phụ\n"
+            "• `/owners` — Xem danh sách owner\n\n"
+            "_Owner phụ dùng bot đầy đủ như owner chính, chỉ không thêm/xoá được owner. "
+            "Chỉ owner chính (biến `OWNER_ID`) mới dùng được `/addowner`, `/delowner`. "
+            "Có thể khai báo sẵn bằng env `EXTRA_OWNER_IDS=id1,id2`._"
+        ),
+    },
+    "games": {
+        "emoji": "🎲", "title": "MINIGAME BÀI",
+        "overview": "/game, /masoi, /endgame",
+        "body": (
+            "*🎲 MINIGAME BÀI (BLACKJACK / TIẾN LÊN / UNO)*\n\n"
+            "• `/game` — Mở menu, mỗi game 1 nút (Blackjack / Tiến Lên / UNO); "
+            "bấm vào game rồi chọn *Chơi đơn* (1v1 với Bot) hoặc *Phòng* nhiều người\n"
+            "• `/masoi` — Mở phòng *Ma Sói* 🐺 \n"
+            "• `/endgame` — Huỷ phòng/ván đang chạy trong chat này (cả Ma Sói)\n\n"
+            "*🐺 Ma Sói:* ~20 vai (Tiên Tri, Phù Thuỷ, Thợ Săn, Thần Tình Yêu, Sói Nằm Vùng, Đao Phủ, Kẻ Ngốc...), "
+            "chế độ Cổ điển/Cân bằng/Drama. Mỗi sáng có *Vòng Mô Tả — Tìm Kẻ Giả Mạo*: bot nhắn riêng từ khoá "
+            "(kho ~1.600 từ), mô tả trong DM, ai lệch số đông bị nghi. Thêm thư nặc danh, vote công khai/kín, "
+            "chế độ câm lặng (bot cần quyền xoá tin nhắn).\n\n"
+            "*Phòng nhiều người (bài):*\n"
+            "• Chủ phòng bấm ➕ để mời, người khác bấm *Tham gia* — cần đã "
+            "từng `/start` với bot ở tin nhắn riêng (để bot chia bài kín được)\n"
+            "• Tối đa 5 người (Blackjack) / 4 người (Tiến Lên — đúng luật 13 lá/người)\n"
+            "• Bài được chia RIÊNG qua tin nhắn riêng, chỉ khi đánh ra mới "
+            "hiện trong nhóm — không lộ bài cho người khác\n\n"
+            "*Chơi với Bot:* Bot ra bài theo thuật toán (đúng luật, không tự "
+            "chế bừa). Lời thoại của Bot do AI sinh ra theo ĐÚNG nhân vật đang chọn ở "
+            "`/tinhcach` — không có câu soạn sẵn: chưa có API key hoặc AI lỗi thì Bot "
+            "im lặng, chỉ chơi bài. Trong lúc nghĩ lời thoại, Bot hiện status \"đang "
+            "suy nghĩ\" kèm media của `/setthinkingmedia` (nếu có). Nhắn tin thường "
+            "trong lúc chơi = chat phiếm với Bot, không ảnh hưởng ván đang chơi.\n\n"
+            "_Lưu ý: Tiến Lên dùng luật đầy đủ miền Nam (sảnh, tứ quý, 3/4 đôi "
+            "thông chặt heo, sảnh rồng tới trắng)._"
+        ),
+    },
 }
 
 # Thứ tự hiện trong bảng tổng quan
 HELP_SECTION_ORDER = [
     "basic", "notes", "filters", "moderation",
-    "media", "monitor", "database", "permissions", "ai",
+    "media", "monitor", "database", "permissions", "ai", "owners", "games",
 ]
 
 

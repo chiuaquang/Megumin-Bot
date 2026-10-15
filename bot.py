@@ -48,6 +48,17 @@ from ai_module import (
 )
 from ai_cancel import AI_ACTIVE_TASKS  # noqa: F401 — re-exported for handlers_basic
 
+# [MINIGAME] Blackjack / Tiến Lên — xem handlers_games.py để biết kiến trúc
+# quyền hạn (vì sao callback "gm:..." và DM chat-với-AI mở cho non-owner).
+from handlers_games import (
+    cmd_game, cmd_endgame, handle_game_callback, try_handle_game_dm, is_game_participant,
+    try_handle_game_chat,
+)
+# [MASÓI] Ma Sói nhiều người (không AI) — xem handlers_werewolf.py.
+from handlers_werewolf import (
+    cmd_masoi, handle_ww_callback, ww_dm_text, ww_group_message, is_ww_participant,
+)
+
 # ── Handlers ──────────────────────────────────────────────────────
 from handlers_basic import (
     cmd_start, cmd_help, cmd_id, cmd_stats, cmd_info,
@@ -79,7 +90,25 @@ from handlers_ai import (
     cmd_addkw, cmd_delkw, cmd_listkw, cmd_groupstatus, cmd_tomtat,
     cmd_dbstats, cmd_cleandb,
 )
-from handlers_monitor import _buf_entry, _push_monitor, _flush_media_group
+from handlers_monitor import _buf_entry, _push_monitor, _flush_media_group, dm_monitor_tap
+# [AI CONTEXT] ghi tin nhắn nhóm (kể cả bot khác), bối cảnh cho AI, tra lịch sử + owner phụ
+import group_context
+from handlers_owners import cmd_addowner, cmd_delowner, cmd_owners, cmd_aictx
+from config import normalize_owner_ids
+
+
+async def _reply_ai(update, text: str):
+    """Gửi câu trả lời AI và (trong nhóm) ghi lại vào lịch sử để lượt sau AI thấy lời mình đã nói."""
+    sent = await safe_reply(update, text)
+    try:
+        chat = update.effective_chat
+        if chat is not None and chat.type in ("group", "supergroup"):
+            name = get_all_personas().get(CONFIG.get("ai_persona", ""), {}).get("name", "AI").split(" (")[0]
+            group_context.record_sent(sent, name)
+    except Exception:
+        pass
+    return sent
+
 
 # ════════════════════════════════════════════════════════════════
 # SHARED AI VISION HELPER
@@ -132,7 +161,7 @@ async def _run_vision_analysis(update: Update, context: ContextTypes.DEFAULT_TYP
             ai_reply = await task
             try: await status_msg.delete()
             except Exception: pass
-            await safe_reply(update, ai_reply)
+            await _reply_ai(update, ai_reply)
         except asyncio.CancelledError:
             try: await status_msg.delete()
             except Exception: pass
@@ -173,7 +202,7 @@ async def _run_voice_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE
             ai_reply = await task
             try: await status_msg.delete()
             except Exception: pass
-            await safe_reply(update, ai_reply)
+            await _reply_ai(update, ai_reply)
         except asyncio.CancelledError:
             try: await status_msg.delete()
             except Exception: pass
@@ -221,7 +250,7 @@ async def _run_video_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE
             ai_reply = await task
             try: await status_msg.delete()
             except Exception: pass
-            await safe_reply(update, ai_reply)
+            await _reply_ai(update, ai_reply)
         except asyncio.CancelledError:
             try: await status_msg.delete()
             except Exception: pass
@@ -253,7 +282,7 @@ async def _run_text_analysis(update: Update, target_text: str, extra_prompt: str
             ai_reply = await task
             try: await status_msg.delete()
             except Exception: pass
-            await safe_reply(update, ai_reply)
+            await _reply_ai(update, ai_reply)
         except asyncio.CancelledError:
             try: await status_msg.delete()
             except Exception: pass
@@ -266,148 +295,11 @@ async def _run_text_analysis(update: Update, target_text: str, extra_prompt: str
         await safe_reply(update, f"❌ *Lỗi phân tích:* `{e}`")
 
 
-def _build_group_ai_context(msg, chat_id: int, max_msgs: int = 20, max_chars: int = 3500) -> str:
-    """Dựng khối 'bối cảnh nhóm' để gắn kèm mỗi lần AI được gọi TRONG NHÓM,
-    giúp Bot đọc hiểu hội thoại xung quanh giống một thành viên bình
-    thường — thay vì chỉ thấy đúng câu chữ owner gõ ra sau tên trigger, và
-    không bắt buộc owner phải reply thì bot mới "đọc" được.
-
-    Gồm 3 phần, xếp theo thứ tự ưu tiên (phần đầu KHÔNG bao giờ bị cắt nếu
-    vượt max_chars — chỉ phần lịch sử mở rộng ở cuối mới bị cắt bớt):
-      1. ĐỐI TƯỢNG MẶC ĐỊNH cho "tin nhắn này/nó/đó/đi":
-         - Nếu owner có reply → dùng đúng tin đang reply (lấy trực tiếp từ
-           Telegram, luôn đầy đủ dù MSG_BUFFER có lưu hay không).
-         - Nếu KHÔNG reply → dùng tin NGAY TRƯỚC ĐÓ trong nhóm (từ
-           MSG_BUFFER) — vì đây là cách một người bình thường đọc nhóm sẽ
-           hiểu "dịch đi"/"tóm tắt đi" nói tới cái gì.
-      2. Hướng dẫn rõ: ưu tiên đối tượng mặc định ở trên, KHÔNG lấy nhầm từ
-         lịch sử hội thoại CŨ giữa AI và owner (vd 1 video đã phân tích từ
-         trước) — đây chính là lỗi đã gặp (Bot lấy nhầm "[Video]" của
-         một lượt phân tích cũ thay vì tin chữ mới nhất trong nhóm).
-      3. N tin nhắn gần nhất trong nhóm (ngữ cảnh mở rộng, không bắt buộc).
-
-    QUAN TRỌNG: khối này chỉ được gắn vào `system_instruction` của LƯỢT GỌI
-    HIỆN TẠI (xem _gemini_chat_with_key_and_tools), KHÔNG lưu vào AI_HISTORY,
-    để lịch sử hội thoại đã lưu không bị phình to/lặp lại mỗi lượt chat.
-    """
-    def _fmt_media_type(e_or_msg, is_buffer_entry: bool) -> str:
-        if is_buffer_entry:
-            return {
-                "photo": "ảnh", "video": "video", "sticker": "sticker",
-                "voice": "voice", "audio": "audio", "file": "file",
-                "gif": "gif", "vidnote": "video note", "poll": "poll",
-            }.get(e_or_msg.get("type", "text"), e_or_msg.get("type", "media"))
-        return "media"
-
-    header = ("[BỐI CẢNH NHÓM — phần này hệ thống tự đính kèm mỗi lượt, "
-              "KHÔNG phải do owner gõ ra]")
-
-    default_block = None   # khối mô tả đối tượng mặc định (reply HOẶC tin ngay trước đó)
-    has_reply_target = False
-
-    # 1a) Có reply cụ thể → ưu tiên tuyệt đối, dùng luôn.
-    reply_msg = getattr(msg, "reply_to_message", None)
-    if reply_msg is not None:
-        r_text = (reply_msg.text or reply_msg.caption or "").strip()
-        r_user = reply_msg.from_user
-        r_label = "NGÀI/CHỦ NHÂN CỦA BẠN" if (r_user and is_owner(r_user.id)) else (
-            (r_user.full_name if r_user else "?"))
-        if r_text:
-            default_block = (
-                "[ĐỐI TƯỢNG MẶC ĐỊNH cho \"tin nhắn này\"/\"tin này\"/\"nó\"/\"cái đó\" — "
-                "owner đang REPLY thẳng vào tin này]\n"
-                f"{r_label}: {r_text[:1500]}"
-            )
-            has_reply_target = True
-        elif reply_msg.photo or reply_msg.video or reply_msg.sticker or reply_msg.document or reply_msg.voice:
-            default_block = (
-                "[ĐỐI TƯỢNG MẶC ĐỊNH] — owner đang reply vào 1 tin media "
-                "(ảnh/video/voice/file), không có chữ/caption để đọc trực tiếp ở đây. "
-                "Nếu owner yêu cầu dịch/đọc nội dung, hãy nói rõ là không nhận được "
-                "nội dung chữ của tin media đó, đừng bịa ra nội dung."
-            )
-            has_reply_target = True
-
-    # Lấy trước lịch sử buffer (dùng chung cho cả bước 1b và bước 3).
-    try:
-        recent = [e for e in MSG_BUFFER
-                  if e.get("chat_id") == chat_id and e.get("msg_id") != msg.message_id]
-    except Exception:
-        recent = []
-    recent = recent[-max_msgs:]
-
-    # 1b) KHÔNG có reply → đối tượng mặc định là tin NGAY TRƯỚC ĐÓ trong nhóm.
-    if not has_reply_target and recent:
-        last_e = recent[-1]
-        last_text = (last_e.get("text") or "").strip()
-        last_label = "NGÀI/CHỦ NHÂN CỦA BẠN" if is_owner(last_e.get("user_id", 0)) else last_e.get("name", "?")
-        if last_text:
-            default_block = (
-                "[ĐỐI TƯỢNG MẶC ĐỊNH cho \"tin nhắn này\"/\"tin đó\"/\"nó\"/\"cái đó\" — "
-                "owner KHÔNG reply cụ thể, nên đây là tin NGAY TRƯỚC ĐÓ trong nhóm]\n"
-                f"{last_label}: {last_text[:1500]}"
-            )
-        else:
-            default_block = (
-                f"[ĐỐI TƯỢNG MẶC ĐỊNH] — tin ngay trước đó trong nhóm là "
-                f"{_fmt_media_type(last_e, True)}, không có chữ/caption. Nếu owner yêu cầu "
-                "dịch/đọc nội dung, hãy nói rõ là không nhận được nội dung chữ, đừng bịa."
-            )
-
-    # 2) Hướng dẫn ưu tiên — chặn đúng lỗi đã gặp: AI lấy nhầm 1 lượt phân
-    #    tích video/ảnh CŨ trong lịch sử hội thoại riêng (AI_HISTORY) thay vì
-    #    tin nhắn mới nhất trong nhóm.
-    priority_note = (
-        "[QUY TẮC ƯU TIÊN — BẮT BUỘC]\nKhi owner dùng từ mơ hồ không chỉ rõ đối tượng "
-        "(vd \"dịch đi\", \"dịch tin nhắn này\", \"tóm tắt đi\", \"nó nói gì vậy\"), LUÔN "
-        "hiểu theo khối [ĐỐI TƯỢNG MẶC ĐỊNH] ở trên — dù đó là tin đang reply hay tin ngay "
-        "trước đó trong nhóm. TUYỆT ĐỐI KHÔNG lấy nội dung từ các lượt chat CŨ giữa bạn và "
-        "owner trước đây (vd 1 video/ảnh bạn từng phân tích ở lượt trước) trừ khi owner nói "
-        "RÕ RÀNG là đang tiếp tục hỏi về đúng thứ đó (vd \"video lúc nãy đó\", \"cái ảnh em "
-        "vừa xem\")."
-    )
-
-    parts = [header]
-    if default_block:
-        parts.append(default_block)
-    parts.append(priority_note)
-
-    # 3) Lịch sử chat mở rộng (không bắt buộc, chỉ để nắm mạch chuyện rộng
-    #    hơn) — phần DUY NHẤT có thể bị cắt bớt nếu vượt max_chars.
-    lines: list[str] = []
-    for e in recent:
-        text = (e.get("text") or "").strip()
-        if not text:
-            continue
-        label = "NGÀI/CHỦ NHÂN CỦA BẠN" if is_owner(e.get("user_id", 0)) else e.get("name", "?")
-        try:
-            ts_str = datetime.fromisoformat(e["ts"]).astimezone(VN_TZ).strftime("%H:%M")
-        except Exception:
-            ts_str = ""
-        lines.append(f"{ts_str} {label}: {text[:300]}")
-    if lines:
-        parts.append(
-            "[LỊCH SỬ CHAT GẦN ĐÂY TRONG NHÓM — chỉ để nắm ngữ cảnh rộng hơn như một "
-            "thành viên đang đọc nhóm, KHÔNG dùng để suy ra đối tượng mặc định (xem quy "
-            "tắc ưu tiên ở trên), KHÔNG cần nhắc lại/tóm tắt trừ khi được yêu cầu]\n"
-            + "\n".join(lines)
-        )
-
-    if len(parts) <= 1:  # chỉ có header, không có gì đáng gắn kèm
-        return ""
-
-    fixed = "\n\n".join(parts[:3])          # header + default_block + priority_note — giữ nguyên
-    rest  = "\n\n".join(parts[3:])          # phần lịch sử mở rộng — có thể bị cắt
-    if rest:
-        budget = max_chars - len(fixed) - 2
-        if budget > 100:
-            block = fixed + "\n\n" + rest[:budget]
-        else:
-            block = fixed
-    else:
-        block = fixed
-    return block
-
+def _build_group_ai_context(msg, chat_id: int, max_msgs: int = 0, max_chars: int = 0) -> str:
+    """Khối bối cảnh nhóm gắn vào lượt AI hiện tại (chỉ vào system_instruction, KHÔNG lưu
+    AI_HISTORY). Toàn bộ logic nằm ở group_context.py; số tin / trần ký tự chỉnh bằng /aictx
+    (tham số max_* giữ lại chỉ để tương thích chữ ký cũ)."""
+    return group_context.build_group_ai_context(msg, chat_id)
 
 
 async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str,
@@ -453,7 +345,7 @@ async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query
         ai_reply = await task
         try: await status_msg.delete()
         except Exception: pass
-        await safe_reply(update, ai_reply)
+        await _reply_ai(update, ai_reply)
     except asyncio.CancelledError:
         try: await status_msg.delete()
         except Exception: pass
@@ -509,10 +401,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
+    data = query.data or ""
+
+    # [MINIGAME] Callback "gm:..." (Blackjack/Tiến Lên) có luồng quyền
+    # riêng (xem handlers_games.py) — CHỦ ĐÍCH cho phép người không phải
+    # owner bấm nút của chính họ trong ván đang chơi, nên phải xử lý
+    # TRƯỚC gate is_owner() bên dưới. Không mở thêm bất kỳ callback nào
+    # khác cho người ngoài.
+    if data.startswith("gm:"):
+        await handle_game_callback(update, context)
+        return
+
+    # [MASÓI] Callback "ww:..." — cùng triết lý với "gm:" (người chơi không phải owner
+    # vẫn bấm được nút của chính họ trong ván Ma Sói đang mở).
+    if data.startswith("ww:"):
+        await handle_ww_callback(update, context)
+        return
+
     if not is_owner(query.from_user.id):
         await query.answer()
         return
-    data = query.data or ""
 
     # ── /filters: xem chi tiết đầy đủ 1 filter (gửi tin riêng, không sửa
     # đè lên bảng tổng quan để vẫn bấm xem được các filter khác) ──
@@ -770,6 +678,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if CONFIG["stats"]["total_messages"] % 100 == 0:
         save_config(CONFIG)
 
+    # [AI CONTEXT] Ghi lại MỌI tin trong nhóm — kể cả tin từ bot/AI khác (vd Mira) và tin được
+    # reply tới — để AI đọc bối cảnh + tra lịch sử. Không bao giờ làm hỏng luồng xử lý chính.
+    if chat.type in ("group", "supergroup"):
+        await group_context.record_incoming(msg)
+
     # ══════════════════════════════════════════════════════════
     # TRIGGER "xóa" → thay cho /del
     # Bắt buộc tin nhắn CHỈ chứa đúng y nguyên từ "xóa" (không thêm/bớt
@@ -830,6 +743,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ══════════════════════════════════════════════════════════
     if chat.type in ("group", "supergroup"):
         gid = CONFIG.get("target_group_id", 0)
+
+        # [MASÓI] Chế độ "Câm lặng": xoá tin người chết / tin ban đêm của người chơi.
+        if await ww_group_message(update, context):
+            return
 
         # Buffer & monitor
         if gid and chat.id == gid:
@@ -975,10 +892,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts = remainder.split()
                 if await handle_tag_command(update, context, parts[0], parts[1:]):
                     return
+                # [MINIGAME] Solo với Bot trong chính chat này -> tán gẫu trong ván bài.
+                if (is_owner(user.id) and is_game_participant(user.id)
+                        and await try_handle_game_chat(update, context, remainder.strip())):
+                    return
                 if CONFIG.get("ai_mode") and is_owner(user.id) and remainder.strip():
                     grp_ctx = _build_group_ai_context(msg, chat.id)
                     await _run_ai_chat(update, context, remainder.strip(), extra_context=grp_ctx)
                     return
+            return
+
+        # [MINIGAME] Đang solo với Bot ngay trong nhóm này: tin thường (kể cả reply bot,
+        # không cần tag) = tán gẫu với Bot trong ván bài. Bỏ qua #ghi-chú và lệnh /.
+        if (is_owner(user.id) and is_game_participant(user.id)
+                and not text.startswith(("#", "/"))
+                and await try_handle_game_chat(update, context, text)):
             return
 
         # Reply vào bot → AI
@@ -1063,7 +991,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if user.id in DB.get("blocked", []):
         return
+    # [MASÓI] Người đang chơi Ma Sói nhắn DM: mô tả từ khoá / thư nặc danh / chat bầy sói / thì thầm người yêu.
+    # Chỉ "nuốt" tin khi ván đang chờ đúng loại tin đó; còn lại rơi xuống luồng cũ (owner vẫn chat AI được).
+    if msg.text and is_ww_participant(user.id):
+        if await ww_dm_text(update, context):
+            return
     if not is_owner(user.id):
+        # [MINIGAME] Không phải owner, nhưng có thể đang chơi Blackjack/Tiến
+        # Lên (chat phiếm với ghế AI cùng bàn) — xem handlers_games.py.
+        # KHÔNG mở thêm bất kỳ chức năng nào khác của bot cho người ngoài.
+        if is_game_participant(user.id):
+            await try_handle_game_dm(update, context)
         return
 
     gid = CONFIG.get("target_group_id", 0)
@@ -1096,6 +1034,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except TelegramError as e:
                 await safe_reply(update, f"❌ *Lỗi sửa:* `{e}`")
         return
+
+    # [MINIGAME] Đang chơi solo với Bot -> chat thường = tán gẫu với Bot TRONG NGỮ CẢNH
+    # VÁN BÀI (không rẽ sang chat AI thường để khỏi lạc đề). /endgame để thoát ván.
+    if msg.text and is_game_participant(user.id):
+        if await try_handle_game_chat(update, context, msg.text.strip()):
+            return
 
     # AI chat trong DM
     if CONFIG.get("ai_mode") and msg.text:
@@ -1464,6 +1408,16 @@ async def _post_init(app_ptb):
     """Hook của python-telegram-bot, chạy sau khi Application khởi tạo xong
     nhưng trước khi bắt đầu polling — nơi lý tưởng để spawn server + ping loop
     trên cùng event loop mà run_polling đang dùng."""
+    # [DANH TÍNH] Bot tự biết mình là ai (id/username thật từ getMe) để không nhầm với bot khác cùng code.
+    try:
+        import bot_identity
+        me = await app_ptb.bot.get_me()
+        bot_identity.set_self(me.id, me.username or "")
+        if me.username:
+            CONFIG["bot_username"] = me.username   # chỉ trong RAM: luôn đúng cho bot này dù config bị dùng chung
+        print(f"  🪪 Danh tính : @{me.username} (id {me.id})")
+    except Exception as e:
+        print(f"  ⚠️  Không lấy được danh tính bot (getMe): {e}")
     await _start_keepalive_server(app_ptb)
     asyncio.create_task(_self_ping_loop(600))  # 10 phút
 
@@ -1566,6 +1520,14 @@ def main():
     owner_id = int(os.environ.get("OWNER_ID", 0)) or CONFIG.get("owner_id", 0)
     if owner_id:
         CONFIG["owner_id"] = owner_id
+    # Owner phụ: danh sách lưu trong config/PostgreSQL (/addowner) + env EXTRA_OWNER_IDS="id1,id2"
+    # (env luôn được hợp nhất vào, hữu ích khi deploy không có PostgreSQL).
+    CONFIG["extra_owners"] = [
+        u for u in normalize_owner_ids(
+            list(normalize_owner_ids(CONFIG.get("extra_owners")))
+            + normalize_owner_ids(os.environ.get("EXTRA_OWNER_IDS", ""))
+        ) if u != CONFIG.get("owner_id")
+    ]
 
     if not token or token == "PASTE_BOT_TOKEN_HERE":
         print("❌ Chưa cấu hình TOKEN!  Set TELEGRAM_TOKEN env var hoặc config.json")
@@ -1676,9 +1638,23 @@ def main():
         ("aipersonaedit", cmd_ai_persona_edit),
         ("aimemory",      cmd_ai_memory),
         ("aimemoryclear", cmd_ai_memory_clear),
+        # [AI CONTEXT] bối cảnh/lịch sử nhóm cho AI + owner phụ
+        ("aictx",        cmd_aictx),
+        ("addowner",     cmd_addowner),
+        ("delowner",     cmd_delowner),
+        ("owners",       cmd_owners),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
+    # [MINIGAME] Blackjack / Tiến Lên — chỉ owner mở phòng (/game), nhưng
+    # một khi phòng mở thì người khác thao tác qua nút bấm (xem handle_callback).
+    app.add_handler(CommandHandler("game", cmd_game))
+    app.add_handler(CommandHandler("endgame", cmd_endgame))
+    app.add_handler(CommandHandler("masoi", cmd_masoi))
+
+    # [DM MONITOR] chuyển mọi tin DM (kể cả lệnh) sang DM owner — group=-1 nên không ảnh hưởng handler khác
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(Update, dm_monitor_tap), group=-1)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     # Bắt mọi join/leave/đổi quyền trong nhóm để cache username NGAY khi

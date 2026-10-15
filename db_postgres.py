@@ -109,7 +109,31 @@ def _create_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_buffer_chat ON msg_buffer(chat_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_buffer_ts   ON msg_buffer(ts DESC)")
 
-    logger.info("[db] Schema OK (3 bảng: ai_history, bot_config, msg_buffer)")
+            # Bảng 4: Lịch sử chat nhóm cho AI (đọc bối cảnh + tra cứu). Tách riêng
+            # khỏi msg_buffer (monitor) để /feed, /cleandb, lọc keyword không bị ảnh hưởng.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id         BIGSERIAL PRIMARY KEY,
+                    chat_id    BIGINT NOT NULL,
+                    msg_id     BIGINT NOT NULL,
+                    user_id    BIGINT,
+                    name       TEXT,
+                    username   TEXT,
+                    text       TEXT,
+                    msg_type   TEXT DEFAULT 'text',
+                    is_bot     BOOLEAN DEFAULT FALSE,
+                    reply_to   BIGINT,
+                    ts         TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_chat_ts ON chat_history(chat_id, ts DESC)")
+            # msg_id > 0 là tin Telegram thật → không lưu trùng; msg_id <= 0 (tin ghi nội bộ) thì bỏ qua ràng buộc
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_history_msg
+                ON chat_history(chat_id, msg_id) WHERE msg_id > 0
+            """)
+
+    logger.info("[db] Schema OK (4 bảng: ai_history, bot_config, msg_buffer, chat_history)")
 
 # ── AI History CRUD ───────────────────────────────────────────────
 
@@ -341,6 +365,117 @@ def msg_buffer_load_since(chat_id: int, since_iso: str, limit: int = 1000) -> li
     except Exception as e:
         logger.error("[db] msg_buffer_load_since: %s", e)
         return []
+
+# ── Chat History (AI context & tra cứu) ──────────────────────────
+
+def _row_to_hist(chat_id: int, r) -> dict:
+    return {
+        "msg_id":   r[0],
+        "chat_id":  chat_id,
+        "user_id":  r[1],
+        "name":     r[2] or "",
+        "username": r[3] or "",
+        "text":     r[4] or "",
+        "type":     r[5] or "text",
+        "is_bot":   bool(r[6]),
+        "reply_to": r[7],
+        "ts":       r[8].isoformat() if r[8] else "",
+    }
+
+_HIST_COLS = "msg_id, user_id, name, username, text, msg_type, is_bot, reply_to, ts"
+
+def chat_history_push(entry: dict, max_keep: int = 5000) -> None:
+    """Lưu 1 tin vào lịch sử chat. Tin trùng (cùng chat_id+msg_id) → cập nhật nội dung (tin bị edit)."""
+    if not _conn:
+        return
+    try:
+        with _lock:
+            with _conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO chat_history
+                        (chat_id, msg_id, user_id, name, username, text, msg_type, is_bot, reply_to, ts)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s::timestamptz, NOW()))
+                    ON CONFLICT (chat_id, msg_id) WHERE msg_id > 0
+                    DO UPDATE SET text = EXCLUDED.text, name = EXCLUDED.name
+                """, (
+                    entry.get("chat_id", 0), entry.get("msg_id", 0), entry.get("user_id", 0),
+                    entry.get("name", ""), entry.get("username", ""),
+                    (entry.get("text") or "")[:2000], entry.get("type", "text"),
+                    bool(entry.get("is_bot", False)), entry.get("reply_to") or None,
+                    entry.get("ts") or None,
+                ))
+                cur.execute("""
+                    DELETE FROM chat_history WHERE id IN (
+                        SELECT id FROM chat_history WHERE chat_id = %s
+                        ORDER BY id DESC OFFSET %s
+                    )
+                """, (entry.get("chat_id", 0), max_keep))
+    except Exception as e:
+        logger.error("[db] chat_history_push: %s", e)
+
+def chat_history_load(chat_id: int, limit: int = 200) -> list:
+    """Load `limit` tin gần nhất của 1 nhóm (cũ → mới)."""
+    if not _conn:
+        return []
+    try:
+        with _lock:
+            with _conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_HIST_COLS} FROM chat_history WHERE chat_id = %s "
+                    "ORDER BY ts DESC, id DESC LIMIT %s", (chat_id, limit))
+                rows = cur.fetchall()
+        return [_row_to_hist(chat_id, r) for r in reversed(rows)]
+    except Exception as e:
+        logger.error("[db] chat_history_load: %s", e)
+        return []
+
+def chat_history_search(chat_id: int, keyword: str = "", who: str = "",
+                        since_iso: str = "", until_iso: str = "", limit: int = 30) -> list:
+    """Tìm trong lịch sử chat: theo từ khoá (ILIKE), người gửi (tên/@username),
+    khoảng thời gian. Trả về tối đa `limit` tin KHỚP GẦN NHẤT, sắp xếp cũ → mới."""
+    if not _conn:
+        return []
+    def _esc(x: str) -> str:
+        return x.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    conds, params = ["chat_id = %s"], [chat_id]
+    if keyword:
+        conds.append("text ILIKE %s ESCAPE '\\'")
+        params.append(f"%{_esc(keyword)}%")
+    if who:
+        conds.append("(name ILIKE %s ESCAPE '\\' OR username ILIKE %s ESCAPE '\\')")
+        params += [f"%{_esc(who.lstrip('@'))}%"] * 2
+    if since_iso:
+        conds.append("ts >= %s::timestamptz"); params.append(since_iso)
+    if until_iso:
+        conds.append("ts < %s::timestamptz"); params.append(until_iso)
+    params.append(limit)
+    try:
+        with _lock:
+            with _conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_HIST_COLS} FROM chat_history WHERE {' AND '.join(conds)} "
+                    "ORDER BY ts DESC, id DESC LIMIT %s", params)
+                rows = cur.fetchall()
+        return [_row_to_hist(chat_id, r) for r in reversed(rows)]
+    except Exception as e:
+        logger.error("[db] chat_history_search: %s", e)
+        return []
+
+def chat_history_clear(chat_id: Optional[int] = None) -> int:
+    """Xoá lịch sử chat của 1 nhóm (hoặc toàn bộ nếu chat_id=None). Trả về số dòng đã xoá (-1 nếu lỗi)."""
+    if not _conn:
+        return -1
+    try:
+        with _lock:
+            with _conn.cursor() as cur:
+                if chat_id is not None:
+                    cur.execute("DELETE FROM chat_history WHERE chat_id = %s", (chat_id,))
+                else:
+                    cur.execute("DELETE FROM chat_history")
+                return cur.rowcount
+    except Exception as e:
+        logger.error("[db] chat_history_clear: %s", e)
+        return -1
 
 def msg_buffer_delete_older_than(days: int, chat_id: Optional[int] = None) -> int:
     """

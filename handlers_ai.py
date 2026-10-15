@@ -275,7 +275,8 @@ async def cmd_ai_persona_new(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not ok:
         await safe_reply(update, f"❌ *Không tạo được!*\n{err}"); return
     await safe_reply(update,
-        f"✅ *Đã tạo nhân vật mới!*\n\n{emoji} *{name}* (key: `{key.lower()}`)\n\n"
+        f"✅ *Đã tạo nhân vật mới!*\n\n{emoji} *{name}* (key: `{key.lower()}`)\n"
+        f"🔔 Trigger gọi AI: `{name.split(' (')[0].strip().lower()}`\n\n"
         f"Dùng `/tinhcach {key.lower()}` để chuyển sang nhân vật này ạ~")
 
 async def cmd_ai_persona_del(update: Update, context: ContextTypes.DEFAULT_TYPE):

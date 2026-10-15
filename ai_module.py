@@ -53,7 +53,9 @@ _MISSING_LIB_MSG = "⚠️ *Thiếu thư viện!* Cài: `pip install google-gena
 
 # ── Constants ─────────────────────────────────────────────────────
 GEMINI_MODELS_FREE = [
+    "gemini-3.8-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -215,10 +217,14 @@ def create_custom_persona(key: str, name: str, prompt: str, emoji: str = "🎭")
     customs = _get_custom_personas()
     if key in customs:
         return False, f"Key `{key}` đã tồn tại rồi — dùng `/aipersonaedit {key}` để sửa, hoặc chọn key khác."
+    display_name = name.strip() or key
+    # Trigger gọi AI = TÊN hiển thị (bỏ phần chú thích trong ngoặc nếu có,
+    # vd "Rin Tohsaka (Fate)" -> "rin tohsaka"), KHÔNG phải key nội bộ.
+    trigger_name = display_name.split(" (")[0].strip().lower() or key
     customs[key] = {
-        "name": name.strip() or key,
+        "name": display_name,
         "emoji": emoji,
-        "trigger": key,
+        "trigger": trigger_name,
         "prompt": prompt.strip(),
         "memory": "",
     }
@@ -488,7 +494,7 @@ async def _gemini_chat(chat_id: int, user_text: str) -> str:
                         db = _get_db()
                         if db: db.save_history(chat_id, history)
                         _bump_ai_stats()
-                        return f"_(Model dự phòng: {fallback})_\n{reply_text}"
+                        return reply_text
                     except Exception:
                         continue
             break
@@ -638,7 +644,7 @@ async def _gemini_chat_with_grounding(chat_id: int, user_text: str) -> str:
                         db = _get_db()
                         if db: db.save_history(chat_id, history)
                         _bump_ai_stats()
-                        return f"_(Model dự phòng: {fallback})_\n{reply_text}"
+                        return reply_text
                     except Exception:
                         continue
             # Grounding không khả dụng (model/SDK lỗi cú pháp tool) → fallback
@@ -978,7 +984,7 @@ async def _gemini_chat_with_ddg_search(chat_id: int, user_text: str) -> str:
                             db.save_history(chat_id, history)
                         _bump_ai_stats()
                         src_count = len(search_results)
-                        label = f"_{src_count} nguồn web_ 🌐  _(Model dự phòng: {fallback})_\n"
+                        label = f"_{src_count} nguồn web_ 🌐\n"
                         return label + reply_text
                     except Exception:
                         continue
@@ -1285,7 +1291,7 @@ async def _gemini_chat_with_tools(chat_id: int, user_text: str, bot, action_chat
                         db = _get_db()
                         if db: db.save_history(chat_id, history)
                         _bump_ai_stats()
-                        return f"_(Model dự phòng: {fallback})_\n{reply_text}"
+                        return reply_text
                     except Exception:
                         continue
             break
@@ -1387,7 +1393,7 @@ async def _gemini_chat_media(
                         _save_history(reply_text)
                         _bump_ai_stats()
                         vlog(f"media OK (fallback) chat_id={chat_id} kind={history_label} model={fallback}")
-                        return f"_(Model dự phòng: {fallback})_\n{reply_text}"
+                        return reply_text
                     except Exception:
                         continue
             break

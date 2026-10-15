@@ -1454,8 +1454,11 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Chỉ restore các field hợp lệ
         from config import DEFAULT_CONFIG
         restored_cfg_keys = []
+        # KHÔNG bao giờ khôi phục danh sách owner từ file backup — nếu không, ai gửi được file
+        # backup giả (kể cả owner phụ) sẽ tự cấp quyền owner cho mình/người khác.
+        _PROTECTED_KEYS = {"owner_id", "extra_owners"}
         for k, v in backup_cfg.items():
-            if k in DEFAULT_CONFIG:
+            if k in DEFAULT_CONFIG and k not in _PROTECTED_KEYS:
                 CONFIG[k] = v
                 restored_cfg_keys.append(k)
 

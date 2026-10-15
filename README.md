@@ -5,6 +5,7 @@
 ## Tính năng chính
 
 Bot **cá nhân** — chỉ owner dùng được lệnh và AI. Thành viên khác bị chặn hoàn toàn.
+Owner chính (`OWNER_ID`) có thể **thêm owner phụ** bằng ID Telegram: `/addowner <id>`.
 
 - **Quản lý nhóm:** ban/kick/mute/warn (3 warn → auto ban), ghi chú (`/note`), bộ lọc
   tự trả lời (`/filter`), nội quy (`/rules`), ghim/bỏ ghim, xóa/purge tin hàng loạt.
@@ -14,9 +15,13 @@ Bot **cá nhân** — chỉ owner dùng được lệnh và AI. Thành viên kh�
   hữu ích khi cần chống raid hoặc giữ trật tự tạm thời.
 - **AI Gemini:** chat đa persona (`/tinhcach`), nhận diện & phân tích ảnh (vision),
   tự xoay nhiều API key khi hết quota, tự tìm kiếm web khi cần (Google/Facebook/YouTube).
+- **AI đọc bối cảnh nhóm:** trả lời dựa trên các tin phía trên (không chỉ câu hỏi), chỉ nói về
+  chủ đề đang chat khi được hỏi; tra lịch sử nhóm khi được hỏi ("hôm qua ai nói gì về X").
+  Thấy được tin của bot/AI khác như Mira — xem mục *Cho bot thấy bot khác* bên dưới.
 - **Giám sát nhóm (monitor):** lưu lại toàn bộ tin nhắn nhóm, đẩy real-time về DM
   chủ nhân, tóm tắt bằng AI (`/tomtat`).
 - **Proxy:** chat 2 chiều giữa chủ nhân và nhóm qua DM khi không tiện vào nhóm trực tiếp.
+- **Minigame:** Blackjack / Tiến Lên / UNO (`/game`) và **Ma Sói** 🐺 (`/masoi`) — 5–20 người thật, ~22 vai trò (Sói Đầu Đàn, Sát Nhân, Hiệp Sĩ...) đã cân bằng bằng mô phỏng, *Vòng Mô Tả — Tìm Kẻ Giả Mạo* với kho ~1.600 từ khoá (không có bot/AI chơi Ma Sói).
 - **Bảo mật:** token & API key được mã hóa (Fernet) cả khi lưu file local lẫn khi
   đồng bộ lên PostgreSQL.
 
@@ -104,6 +109,7 @@ Trong tab **Environment** của Web Service, thêm các biến:
 | `DATABASE_URL` | URL từ Render Postgres (Bước 1) | ✅ (khuyến nghị) |
 | `WEBHOOK_URL` | URL của web service (xem bên dưới) | tuỳ chọn |
 | `CONFIG_FERNET_KEY` | Key Fernet tự quản lý (xem ghi chú) | tuỳ chọn |
+| `EXTRA_OWNER_IDS` | Owner phụ: `id1,id2` (hoặc thêm bằng `/addowner`) | tuỳ chọn |
 
 ### Lấy WEBHOOK_URL
 Bot chạy ở **polling mode** (không phải webhook thật) — biến này chỉ dùng để bot
@@ -134,6 +140,22 @@ Xem logs trong tab **Logs** — bot khởi động thành công khi thấy:
 🌸🌸🌸 MAID BOT 2.2.0 - ĐANG CHẠY 🌸🌸🌸
 📡 Polling mode
 ```
+
+---
+
+## Cho bot thấy bot khác (Mira…) & bối cảnh nhóm
+
+Mặc định Telegram **không** gửi tin của bot khác cho bot của bạn. Để bot thấy Mira và các bot khác:
+
+1. Mở **@BotFather** → chọn bot → bật **Bot-to-Bot Communication Mode**.
+2. Cho bot làm **admin** của nhóm (hoặc tắt *Group Privacy* trong @BotFather).
+
+Chưa làm vậy thì bot vẫn thấy tin của bot khác **khi ai đó reply vào tin đó**.
+Bot không tự trả lời tin của bot khác nên không bị vòng lặp bot–bot.
+
+Lịch sử nhóm lưu trong bảng `chat_history` (PostgreSQL; không có DB thì chỉ giữ ~600 tin gần nhất
+trong RAM). Chỉnh bằng `/aictx` (số tin bối cảnh, trần ký tự, bật/tắt ghi, xoá lịch sử).
+⚠️ Bot ghi lại tin nhắn mọi nhóm nó có mặt — hãy báo thành viên nếu cần.
 
 ---
 

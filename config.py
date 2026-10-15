@@ -44,6 +44,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_CONFIG: dict = {
     "token":            "PASTE_BOT_TOKEN_HERE",
     "owner_id":         0,
+    "extra_owners":     [],     # owner phụ do owner chính thêm bằng /addowner <telegram_id>
+                                # (quyền dùng bot như owner chính, trừ việc thêm/xoá owner)
+    "ai_log_groups":    True,   # ghi lại tin nhắn MỌI nhóm bot có mặt để AI đọc bối cảnh/tra lịch sử
+    "ai_ctx_msgs":      30,     # số tin gần nhất đính kèm làm bối cảnh mỗi lần AI trả lời trong nhóm (0 = tắt)
+    "ai_ctx_chars":     6000,   # trần ký tự của khối bối cảnh nhóm
     "bot_username":     "",
     "target_group_id":  0,
     "proxy_mode":       False,
@@ -135,6 +140,23 @@ def _decrypt_config(cfg: dict, f) -> dict:
             out[field] = _dec(out[field], f)
     return out
 
+def normalize_owner_ids(raw) -> list:
+    """Chuẩn hoá danh sách id owner (list/tuple/set/chuỗi 'id1,id2') → list[int]
+    không trùng, bỏ giá trị không hợp lệ. Luôn trả về list MỚI."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.replace(";", ",").split(",")
+    out = []
+    for x in raw:
+        try:
+            v = int(str(x).strip())
+        except (TypeError, ValueError):
+            continue
+        if v > 0 and v not in out:
+            out.append(v)
+    return out
+
 # ── Persistence ──────────────────────────────────────────────────
 def load_config() -> dict:
     f = _get_fernet()
@@ -148,6 +170,7 @@ def load_config() -> dict:
             # (vd "stats" đã có từ bản cũ nhưng thiếu field "ai_messages" mới) —
             # backfill riêng cho các dict con cần field mới.
             cfg.setdefault("stats", {}).setdefault("ai_messages", 0)
+            cfg["extra_owners"] = normalize_owner_ids(cfg.get("extra_owners"))
             # Sửa giá trị bot_username="0" cũ (bug mặc định trước đây)
             if cfg.get("bot_username") == "0":
                 cfg["bot_username"] = ""
