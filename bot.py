@@ -97,9 +97,14 @@ from handlers_owners import cmd_addowner, cmd_delowner, cmd_owners, cmd_aictx
 from config import normalize_owner_ids
 
 
-async def _reply_ai(update, text: str):
-    """Gửi câu trả lời AI và (trong nhóm) ghi lại vào lịch sử để lượt sau AI thấy lời mình đã nói."""
-    sent = await safe_reply(update, text)
+async def _reply_ai(update, text: str, reply_to_message_id: int | None = None):
+    """Gửi câu trả lời AI và (trong nhóm) ghi lại vào lịch sử để lượt sau AI thấy lời mình đã nói.
+
+    `reply_to_message_id`: khi AI đang nhắm tới 1 người cụ thể (vd owner reply
+    vào tin ai đó rồi bảo "chửi nó"), câu trả lời sẽ reply thẳng vào tin nhắn
+    của người đó thay vì reply vào tin ra lệnh."""
+    kw = {"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {}
+    sent = await safe_reply(update, text, **kw)
     try:
         chat = update.effective_chat
         if chat is not None and chat.type in ("group", "supergroup"):
@@ -302,6 +307,62 @@ def _build_group_ai_context(msg, chat_id: int, max_msgs: int = 0, max_chars: int
     return group_context.build_group_ai_context(msg, chat_id)
 
 
+def _resolve_ai_target(msg):
+    """Xác định "đối tượng" mà owner muốn AI nhắc tới khi gọi bot trong nhóm.
+
+    Ưu tiên:
+      1. Tin nhắn đang REPLY vào tin của NGƯỜI KHÁC (không phải bot của mình,
+         không phải chính owner) → đối tượng = tác giả tin được reply.
+      2. Có @mention / text_mention (tag thẳng user) trong tin nhắn gọi bot.
+    Trả về dict {user_id, full_name, username, target_msg_id} hoặc None nếu
+    không xác định được (khi đó AI tự suy luận như cũ)."""
+    me = msg.from_user
+    me_id = me.id if me else 0
+    bot_uname = (CONFIG.get("bot_username", "") or "").lstrip("@").lower()
+
+    # 1. Reply vào tin người khác
+    rp = getattr(msg, "reply_to_message", None)
+    if rp is not None:
+        ru = getattr(rp, "from_user", None)
+        # sender_chat (đăng ẩn danh dưới tên kênh) không có from_user → bỏ qua
+        if ru is not None and ru.id != me_id:
+            ru_uname = (ru.username or "").lstrip("@").lower()
+            # Reply vào chính bot mình = đang chat tiếp với bot → không phải đối tượng
+            if not (ru.is_bot and ru_uname == bot_uname):
+                return {
+                    "user_id": ru.id,
+                    "full_name": ru.full_name,
+                    "username": (ru.username or "").lstrip("@"),
+                    "target_msg_id": rp.message_id,
+                }
+
+    # 2. Tag thẳng @username / text_mention trong tin nhắn
+    text = msg.text or msg.caption or ""
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    for ent in entities:
+        if ent.type == "text_mention" and getattr(ent, "user", None):
+            u = ent.user
+            if u.is_bot or u.id == me_id:
+                continue
+            return {
+                "user_id": u.id,
+                "full_name": u.full_name,
+                "username": (u.username or "").lstrip("@"),
+                "target_msg_id": None,
+            }
+        if ent.type == "mention":
+            uname = text[ent.offset:ent.offset + ent.length].lstrip("@")
+            if not uname or uname.lower() == bot_uname:
+                continue  # bỏ qua tag chính bot
+            return {
+                "user_id": 0,
+                "full_name": "@" + uname,
+                "username": uname,
+                "target_msg_id": None,
+            }
+    return None
+
+
 async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str,
                         extra_context: str = "") -> None:
     """Hiện status 'đang suy nghĩ', gọi Gemini agent mode (tự gọi tool quản
@@ -325,6 +386,32 @@ async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query
     else:
         action_chat_id = CONFIG.get("target_group_id", 0) or None
 
+    # [TAG FIX] Xác định đối tượng cần nhắc tới TRƯỚC khi gọi AI (chỉ trong nhóm).
+    # Ghép thông tin username THẬT vào system prompt để AI không bịa @mention,
+    # đồng thời giữ lại để hậu xử lý: ép tag @username + reply đúng tin.
+    target = _resolve_ai_target(msg) if chat.type in ("group", "supergroup") else None
+    if target:
+        if target["username"]:
+            extra_context += (
+                "\n\n[ĐỐI TƯỢNG CẦN NHẮC TỚI — do hệ thống xác định từ tin nhắn, "
+                "KHÔNG phải do người hỏi gõ ra]\n"
+                f"- Tên hiển thị: {target['full_name']}\n"
+                f"- Username Telegram: @{target['username']}\n"
+                "QUY TẮC BẮT BUỘC:\n"
+                f"1. Mở đầu câu trả lời bằng @{target['username']} (viết ĐÚNG Y HỆT, "
+                "không thêm/bớt/sửa ký tự).\n"
+                "2. TUYỆT ĐỐI không tự bịa @username khác — chỉ dùng đúng username trên.\n"
+                "3. Mọi đại từ mơ hồ ('nó', 'hắn', 'cậu ta'...) trong yêu cầu đều chỉ người này."
+            )
+        else:
+            extra_context += (
+                "\n\n[ĐỐI TƯỢNG CẦN NHẮC TỚI — do hệ thống xác định từ tin nhắn]\n"
+                f"- Tên hiển thị: {target['full_name']} (người này KHÔNG có @username)\n"
+                "QUY TẮC BẮT BUỘC:\n"
+                "1. KHÔNG được bịa @username cho người này dưới mọi hình thức.\n"
+                "2. Chỉ gọi bằng tên hiển thị. (Bot sẽ tự reply thẳng vào tin nhắn của họ.)"
+            )
+
     status_msg = await send_thinking_status(
         msg,
         f"*{get_all_personas().get(CONFIG.get('ai_persona',''), {}).get('name', 'AI').split(' (')[0]} đang suy nghĩ..* 💭",
@@ -345,7 +432,18 @@ async def _run_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, query
         ai_reply = await task
         try: await status_msg.delete()
         except Exception: pass
-        await _reply_ai(update, ai_reply)
+        # [TAG FIX] Hậu xử lý đảm bảo tag đúng người + reply đúng tin:
+        #  - Có @username thật → ép câu trả lời mở đầu bằng @username đó.
+        #  - Không có @username nhưng biết tin nhắn của họ (do owner reply vào)
+        #    → reply thẳng vào tin đó (Telegram tự hiển thị reply tới họ).
+        reply_to_id = None
+        if target:
+            if target.get("username"):
+                tag = "@" + target["username"]
+                if tag.lower() not in ai_reply.lower():
+                    ai_reply = f"{tag} {ai_reply}"
+            reply_to_id = target.get("target_msg_id")
+        await _reply_ai(update, ai_reply, reply_to_message_id=reply_to_id)
     except asyncio.CancelledError:
         try: await status_msg.delete()
         except Exception: pass
