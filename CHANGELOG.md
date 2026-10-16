@@ -6,6 +6,25 @@
 
 # 📋 Changelog
 
+## [2.9.1] — Sửa tag đúng người + reply đúng tin khi gọi AI trong nhóm
+
+### 🎯 Đối tượng nhắc tới do code xác định (không phó mặc cho AI)
+- Khi owner gọi bot trong nhóm, bot tự xác định "đối tượng" theo thứ tự ưu tiên:
+  1. Tin nhắn đang **reply vào tin của người khác** (không phải bot, không phải chính owner)
+     → đối tượng = tác giả tin được reply;
+  2. Có **@mention / text_mention** tag thẳng user trong tin nhắn.
+- Thông tin username **thật** được ghép vào system prompt kèm quy tắc bắt buộc:
+  mở đầu câu trả lời bằng đúng `@username`, tuyệt đối không bịa @username.
+- Người không có @username → cấm bịa username, chỉ gọi tên hiển thị.
+
+### 💬 Hậu xử lý câu trả lời AI (`_run_ai_chat`)
+- Nếu AI quên tag mà đối tượng có @username thật → code tự chèn `@username` vào đầu câu.
+- Nếu xác định được tin nhắn của đối tượng (do owner reply vào) → câu trả lời sẽ
+  **reply thẳng vào tin nhắn của người đó** thay vì reply vào tin ra lệnh.
+  - Vd: reply vào tin của A rồi gõ "Mixao chửi nó" → bot reply vào tin của A và chửi A.
+- `safe_reply()` giờ khôi phục các @mention bị `to_markdown_v2()` escape
+  (`@Anh\_Yeu` → `@Anh_Yeu`) để mention luôn bấm được.
+
 ## [2.9.0] — AI đọc bối cảnh nhóm + nhìn thấy bot khác + tra lịch sử · Owner phụ
 
 ### 🧠 AI đọc bối cảnh nhóm (`group_context.py`)
