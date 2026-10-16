@@ -417,6 +417,19 @@ def _dm_echo(sent) -> None:
         pass
 
 
+# @username sau khi qua to_markdown_v2() sẽ bị escape dấu gạch dưới
+# (vd @Anh_Yeu → @Anh\_Yeu) khiến Telegram không linkify được mention.
+# Regex này khôi phục lại các @mention về dạng nguyên bản.
+_MENTION_RE = re.compile(r"@([A-Za-z0-9_]+(?:\\_[A-Za-z0-9_]+)*)")
+
+def _fix_md_mentions(converted: str) -> str:
+    """Khôi phục @username bị escape trong text đã convert MarkdownV2.
+    Telegram chỉ tạo mention bấm được khi các ký tự @username còn nguyên."""
+    if not converted or "@" not in converted:
+        return converted
+    return _MENTION_RE.sub(lambda m: "@" + m.group(1).replace("\\_", "_"), converted)
+
+
 async def safe_reply(update: Update, text: str, **kw):
     """Trả lời tin nhắn. Trả về Message đã gửi (hoặc None nếu thất bại) để nơi
     gọi có thể ghi lại message_id — các caller cũ bỏ qua giá trị trả về nên
@@ -426,7 +439,7 @@ async def safe_reply(update: Update, text: str, **kw):
         return None
     try:
         sent = await message.reply_text(
-            to_markdown_v2(text), parse_mode=ParseMode.MARKDOWN_V2, **kw
+            _fix_md_mentions(to_markdown_v2(text)), parse_mode=ParseMode.MARKDOWN_V2, **kw
         )
         _dm_echo(sent)
         return sent
